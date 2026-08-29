@@ -1,0 +1,131 @@
+---
+title: "Request Pipeline — 23-Stage Layer Order Reference"
+sidebarTitle: "Request Pipeline"
+description: "All 23 Arcature pipeline stages: what each does, how to enable it, why metrics live outside stage 21, and why the order is an asserted contract."
+---
+
+Every request that reaches an Arcature application travels through a fixed, ordered sequence of Tower layers. The order is defined once in `src/application/pipeline.rs`, documented with a justification per row, and asserted by the test suite. Calling `.inertia()` before `.csrf()` or after it produces the same pipeline — the builder collects layers into named slots, and `Pipeline::apply` imposes the order.
+
+The reason this matters: layer order determines behaviour in ways that are invisible until the day they matter. Security headers outside the body limit means a `413` carries `nosniff`. The access log outside the panic catcher means a `500` is logged. The session outside CSRF means the token can be looked up. These are not style questions; they are correctness questions, and they are written down rather than inferred from builder call order. The full reasoning is in [ADR 0004](/reference/decisions#adr-0004-layer-order-is-a-written-contract).
+
+## The 23-Stage Pipeline
+
+A request travels **down** this list; a response travels back **up**. Outermost first.
+
+| # | Stage | Always on | Description |
+|---|---|---|---|
+| 1 | `DevProxy` | No — `dev-proxy` feature | Forwards Vite HMR and asset requests to the Vite IPC endpoint. Pass-through when `ARCATURE_VITE_IPC` is unset. Must be outermost to intercept the HMR WebSocket upgrade. |
+| 2 | `Proxy` | No — explicit `.proxy(..)` | Pre-routing URI rewriting. Runs before route selection; a rewrite that happens after matching would miss. |
+| 3 | `Health` | Yes, unless `.health(false)` | Merged **beside** the router (not layered over it). `/up/live` and `/up/ready` answer from the lifecycle alone — no session load, no maintenance `503`, no access-log line per orchestrator probe. |
+| 4 | `UagEndpoint` | No — `uag` feature + `.uag_endpoint(..)` | Also merged beside the router. Exposes `GET /_arcature/uag.json` describing the running application graph. Debug builds only. |
+| 5 | `Compression` | No — `.compression()` | Outermost response-shaping layer. Sees the final body regardless of who produced it, including error responses from stages below. |
+| 6 | `SecurityHeaders` | No — `.security_headers(..)` | Outside the body limit and timeout **on purpose**: a `413` and a `408` are browser-rendered documents that need `nosniff` and a framing policy. Mints the per-request CSP nonce. |
+| 7 | `CORS` | No — `.cors(..)` | Answers a preflight without waking anything below. Inside `SecurityHeaders` so the preflight response still carries security headers. |
+| 8 | `RequestId` / `TraceContext` | No — `.request_id()` / `.trace_context()` | Every response carries `x-request-id`. Outside all admission stages so a refused request still resolves its trace and carries an id. `TraceContext` shares this slot (see note below). |
+| 9 | `AccessLog` / `Metrics` | No — `.access_log()` / `.metrics(..)` | Outside the panic catcher, body limit, timeout, and rate limiter so `500`, `413`, `408`, and `429` responses are all logged and counted. `Metrics` shares this slot (see note below). |
+| 10 | `CatchPanic` | No — `.catch_panic()` | Turns a handler panic into a `500` RFC 9457 response. The panic payload is discarded — it often contains file paths or SQL fragments. Inside the access log so the `500` is recorded. |
+| 11 | `ErrorMapping` | No — `.error_mapping(..)` | Gives RFC 9457 problem bodies to every bodiless error below (bare `404`, `405`, `408`, `413`). Redacts `text/plain` 5xx bodies in release when `.redact_errors(true)`. |
+| 12 | `BodyLimit` | No — `.body_limit(bytes)` | Rejects an oversized upload before buffering it. Before anything that reads a body. |
+| 13 | `Timeout` | No — `.timeout(duration)` | Bounds everything inside it. Outside the router so a slow handler cannot hold a connection open indefinitely. |
+| 14 | `Maintenance` | No — `.maintenance(..)` | Outside session and CSRF: a maintenance `503` must not depend on the session store being maintained, and a form POST during the window gets the `503` rather than a CSRF `419`. |
+| 15 | `RateLimit` | No — `.rate_limit(..)` | Inside maintenance (a request answered by `503` costs no quota). Outside the session (a refused request never touches the session store). After the health merge (a throttled health probe is a self-inflicted outage). |
+| 16 | `Session` | No — `.session(..)` | Must load before CSRF needs the token and before handlers extract it. |
+| 17 | `CSRF` | No — `.csrf(..)` | Unsafe methods (POST, PUT, PATCH, DELETE) are rejected here before they can act. After the session, because the token is in the session. |
+| 18 | `Inertia` | No — `.inertia(..)` | **Innermost framework layer.** Inserts `InertiaConfig` and `InertiaRequest` into extensions. Innermost so a CSRF rejection or a timeout is returned as itself, not dressed up as an Inertia response the client would try to render. |
+| 19 | `PageContracts` | No — `.page_contracts(..)` | Carries the `ContractArtifact` extension for `arc typegen` and the UAG endpoint. Data, not behaviour; position only needs to be inside something a handler can see. |
+| 20 | `RedirectMapper` | **Yes, unless `.redirect_mapper(false)`** | Resolves `redirect().route(..)` against the route table and writes flash data through the session. On by default — a named redirect that silently returns `400` is not a default anyone would choose. Inside `Inertia` so Inertia's `303`-for-PUT/PATCH/DELETE rule sees a finished redirect. |
+| 21 | User `.layer()` calls | — | Applied in call order (first call is outermost among user layers). Wraps the router directly. Innermost by design: a user layer sees a request that has already been limited, timed, and authenticated. |
+| 22 | Router | Always | Route matching and the handler. |
+| 23 | `StaticFiles` | No — `.static_files(..)` | The router's fallback — only sees requests no route matched. Inside every layer above, so a served file gets the same compression, headers, and access log as a handler response. |
+
+<Note>
+  Stages 1 and 2 wrap the router **as a service** (applied after `with_state`). Stages 5–21 wrap it as a `Router`. Stages 3 and 4 are `merge`s, which is exactly what makes them exempt from the layers below. This split is why `pipeline.rs` has two functions.
+</Note>
+
+## The Two Shared Slots
+
+Two stages each carry a second layer at the same position. This placement is the whole point:
+
+### Stage 8: `RequestId` + `TraceContext`
+
+```rust
+// Enable via the builder:
+Application::new()
+    .request_id()         // stage 8: generates and echoes x-request-id
+    .trace_context()      // stage 8: resolves W3C traceparent / tracestate
+```
+
+Both sit at stage 8 rather than at stage 21 because stage 21 is **inside** the admission stages (body limit, timeout, maintenance, rate limit). A trace context installed at 21 would never see a `413`, `408`, `503`, or `429` — exactly the traffic an incident is about.
+
+### Stage 9: `AccessLog` + `Metrics`
+
+```rust
+Application::new()
+    .access_log()           // stage 9: one line per request
+    .metrics(registry)      // stage 9: Prometheus counters and histograms
+```
+
+Both sit at stage 9 for the same reason. A counter installed at stage 21 would not count refused requests, making the metric disagree with reality at the moment of an incident. From stage 9 both see the full request universe and agree with each other.
+
+## Why User Layers Live at Stage 21
+
+Stage 21 is the only position the builder offers for application code. It is innermost by design — a request reaches a user layer after it has already been:
+
+- limited to its declared byte count (12)
+- timed against its declared deadline (13)
+- checked against the maintenance window (14)
+- checked against the rate limit (15)
+- loaded with a session (16)
+- validated for CSRF (17)
+
+This means a user middleware can safely read `Session`, `Auth<U>`, and other extractors without checking whether the session was loaded or the CSRF check passed. The framework guarantees those invariants hold before the user layer runs.
+
+The cost is the one described in [ADR 0004](/reference/decisions#adr-0004-layer-order-is-a-written-contract): there is no way to insert a layer between the session and CSRF. An application that genuinely needs that falls back to assembling the router with raw Axum.
+
+## Pipeline as Code
+
+The builder collects everything into named slots, then `Pipeline::apply` imposes the order. The application at its simplest:
+
+```rust
+use arcature::application::EngineResult;
+use arcature::prelude::*;
+
+#[arcature::main]
+async fn main() -> EngineResult<()> {
+    Application::new()
+        .routes(Routes::new([Route::get("/", index).name("home")]))
+        .build()
+        .run()
+        .await
+}
+```
+
+A bare `.routes(..).build()` produces a router with stage 20 (redirect mapper) and stage 3 (health endpoints) and nothing else — every other stage in the table is a decision you made.
+
+A fully configured pipeline:
+
+```rust
+Application::new()
+    .routes(routes)
+    .compression()
+    .security_headers(SecurityHeaders::new().with_hsts())
+    .cors(CorsConfig::new().allow_origin("https://app.example.com"))
+    .request_id()
+    .trace_context()
+    .access_log()
+    .metrics(prometheus_registry)
+    .catch_panic()
+    .error_mapping(ErrorMapping::new().redact_errors(true))
+    .body_limit(10 * 1024 * 1024)          // 10 MB
+    .timeout(Duration::from_secs(30))
+    .maintenance(maintenance_handle)
+    .rate_limit(RateLimit::per_second(100))
+    .session(session_config, session_store)
+    .csrf(CsrfConfig::inertia())
+    .inertia(InertiaConfig::new())
+    .build()
+    .run()
+    .await
+```
+
+Regardless of the order these builder calls appear in source, the resulting pipeline always has stages 5 through 21 applied in the documented order.

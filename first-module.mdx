@@ -1,0 +1,210 @@
+---
+title: "Building Your First Arcature Module End to End"
+sidebarTitle: "First Module"
+description: "Learn how arc make:module generates a controller, service, and routes directory, and how the module! macro wires everything into the application graph."
+---
+
+A fresh Arcature application organises code by kind: every controller in `app/controllers/`, every service in `app/services/`. That works well for a single feature. At ten features, "show me everything billing does" means opening seven directories and knowing which files in each belong to billing. A *module* is the alternative layout: one directory owns one feature's controller, service, and routes, and a `module!` block at its root is the index of everything inside. The two layouts coexist deliberately — the scaffold's own `Web` module keeps the by-kind directories, and any application can use one layout, the other, or both.
+
+This page goes from `arc new` to a route that answers, without editing a file by hand.
+
+## Generate a module
+
+```bash
+arc new acme --stack vue --db sqlite
+cd acme
+arc make:module billing
+```
+
+```text
+created app/modules/billing/mod.rs
+updated app/modules/mod.rs
+created app/modules/billing/controller.rs
+created app/modules/billing/service.rs
+created app/modules/billing/routes.rs
+```
+
+Four files written, one updated. The module is immediately registered — nothing else needs to be touched before it serves.
+
+```bash
+arc serve --port 3000
+curl localhost:3000/billing
+# BillingController::index
+```
+
+## What was generated
+
+<Tabs>
+  <Tab title="mod.rs">
+    `app/modules/billing/mod.rs` is the module index. The `module!` macro records what this feature contains so the application graph — and through it `arc routes`, `arc typegen`, and `arc build` — can see it.
+
+    ```rust
+    pub mod controller;
+    pub mod routes;
+    pub mod service;
+
+    use arcature::prelude::*;
+
+    use controller::BillingController;
+
+    module! {
+        pub Billing {
+            controllers: [BillingController],
+            services: [BillingService],
+            routes: routes::BILLING_ROUTES,
+        }
+    }
+    ```
+
+    Notice that `BillingService` is named but not imported — and that is not an oversight. `controllers:` and `routes:` are *resolved* at the call site: the first reads `ControllerMetadata::METHODS`, the second is a path to a `&'static` const. `services:` and `policies:` are recorded as names only. Importing a type the macro never resolves would be an unused import.
+  </Tab>
+  <Tab title="controller.rs">
+    ```rust
+    use arcature::prelude::*;
+
+    pub struct BillingController;
+
+    #[controller]
+    impl BillingController {
+        pub async fn index() -> Result<Response> {
+            Ok(text(StatusCode::OK, "BillingController::index"))
+        }
+    }
+    ```
+
+    `Result`, `Response`, `StatusCode`, and `text` all come from the prelude — a controller should not need a `use` list before it does any work.
+
+    Every method in a `#[controller]` block must be `pub`, `async`, take no `self`, and declare a return type. The macro rejects anything else with a compile error (`error[ARC-M004]`).
+  </Tab>
+  <Tab title="service.rs">
+    ```rust
+    #[service]
+    pub struct BillingService {
+        db: Db,
+    }
+    ```
+
+    `#[service]` generates `Resolve<S>`, which composes the struct from the application's resources per request. Each field type is resolved in turn, so a service may hold another service as a field. Keep methods framework-agnostic — take domain values, return domain values, and let the controller map the result to HTTP.
+  </Tab>
+  <Tab title="routes.rs">
+    ```rust
+    use super::controller::BillingController;
+    use crate::bootstrap::AppState;
+
+    routes! {
+        pub billing {
+            state: AppState;
+
+            get "/billing" => BillingController::index { name: billing.index }
+        }
+    }
+    ```
+
+    The path is absolute. Living inside a module adds no URL prefix — a module is a unit of source organisation, not a mount point. Use a [route group](/routing) when you want a shared prefix.
+
+    The route *name* carries the module name, and that matters more than it looks. Two modules claiming the same **path** panics at boot (Axum detects it), so it cannot reach production unnoticed. Two modules claiming the same **name** does not panic — the later one silently wins and `url_for("index", ..)` starts resolving somewhere else. Namespacing the name is what makes ten modules safe to merge.
+  </Tab>
+</Tabs>
+
+## How the wiring works
+
+`arc make:module` adds three lines to `app/modules/mod.rs`: the `pub mod` declaration, one entry in the descriptor list, and one in the route list. The generator only ever inserts into the two marked regions:
+
+```rust
+pub fn modules() -> Vec<ModuleDescriptor> {
+    vec![
+        // arc:modules descriptors
+        billing::billing_module().clone(),
+        // arc:end
+    ]
+}
+
+pub fn routes() -> Routes<AppState> {
+    let collections: Vec<Routes<AppState>> = vec![
+        // arc:modules routes
+        billing::routes::billing_routes(),
+        // arc:end
+    ];
+    collections.into_iter().fold(Routes::empty(), Routes::merge)
+}
+```
+
+`app/mod.rs` appends `modules()` to the scaffold's `Web` module before handing the list to `ApplicationGraph::new`; `bootstrap/app.rs` merges `routes()` into the application's route table. Both were already written by `arc new` — the generator only ever inserts into the two marked regions.
+
+Editing the file by hand is fine. Reorder the entries, reformat them, add one yourself. The generator matches the `arc:modules` / `arc:end` markers and nothing else about the surrounding text, and it skips an entry that is already there.
+
+<Warning>
+Deleting a marker is the one thing that breaks automated wiring. When that happens the generator writes the module files anyway and tells you what to paste:
+
+```text
+note: app/modules/mod.rs has no `// arc:modules routes` marker
+      -- add `billing::routes::billing_routes(),` to its routes list by hand
+```
+</Warning>
+
+## Nested module names
+
+A name with slashes nests, and any intermediate `mod.rs` files are created automatically:
+
+```bash
+arc make:module admin/reports
+```
+
+```text
+created app/modules/admin/reports/mod.rs
+updated app/modules/admin/mod.rs
+updated app/modules/mod.rs
+```
+
+The registration follows the nesting — `admin::reports::reports_module()` — and so does the route name, which becomes `admin.reports.index`. The URL does not: `routes.rs` still declares an absolute path, so the module serves `/admin/reports` because that is what is written there, not because of where it sits on disk.
+
+## The `module!` macro sections
+
+Every section is optional. Order between sections is free. Trailing commas are optional. The right-hand column determines what a typo costs: a resolved entry is a type or const the macro reads, so a misspelled name is a compile error at the `module!` line. A name-only entry is recorded as a string, so a misspelled service or policy name compiles — and the graph reports the string you wrote without disagreeing.
+
+| Section | Holds | Resolved at the call site? |
+|---|---|---|
+| `imports` | Module names this one depends on | no — names |
+| `exports` | Module names this one provides | no — names |
+| `controllers` | Controller types | **yes** — reads `ControllerMetadata::METHODS` |
+| `services` | Service type names | no — names |
+| `policies` | Policy type names | no — names |
+| `routes` | A path to a `&'static [RouteDescriptor]` const | **yes** |
+| `listeners` | Event → listener name pairs | no — names |
+| `jobs` | Job kind, version, and handler name | no — names |
+| `commands` | Command name → function name pairs | no — names |
+| `schedules` | Job kind, version, and cadence | no — names |
+| `pages` | Paths to `#[page]` types | **yes** — reads `PAGE_CONTRACT_ENTRY` |
+
+<Tip>
+A type missing from a `module!` block still compiles and still serves. It is simply invisible to the graph, and therefore to `arc routes`, `arc typegen`, and `arc build`. The `module!` macro exists to close that gap.
+</Tip>
+
+## What the graph checks
+
+`ApplicationGraph::new` runs at boot and rejects three wiring mistakes. The scaffold calls `.expect(..)` on the result, so all three surface as a panic at boot — the honest answer, because each one is the same on every run and has nothing to do with the request.
+
+| `GraphError` variant | Meaning |
+|---|---|
+| `DuplicateModule` | Two modules declared the same name |
+| `UnknownImport` | An `imports:` entry names a module the graph does not hold |
+| `CircularDependency` | Modules import each other in a loop; the error lists the cycle in order |
+
+## What is deliberately not scaffolded
+
+A generated module has four files, not five. `arc make:policy` is one command away, but a generated policy cannot compile until it is pointed at a model and a user type — `Policy<M>` bounds its associated `User` by `AuthUser`, so no placeholder type-checks. Shipping a policy stub inside a module would mean `arc make:module billing` produces a project that does not build.
+
+Add one once the feature has a model and a user type to point it at:
+
+```bash
+arc make:policy invoice
+```
+
+```text
+created app/policies/invoice.rs
+updated app/policies/mod.rs
+note: invoice names `Invoice` and `User`; point them at the model this policy
+      guards and the application's user type
+```
+
+That file lands in `app/policies/`, not in the module. Move it under `app/modules/billing/policy.rs` if you want the feature to own it, add the `pub mod policy;` line, and name the type in the module's `policies:` list. Nothing in the generator or the graph depends on where the file sits — the list is what the graph reads.

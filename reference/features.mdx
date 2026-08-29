@@ -1,0 +1,263 @@
+---
+title: "Cargo Feature Flags — Complete Reference for Arcature"
+sidebarTitle: "Features"
+description: "Every Arcature Cargo feature — what it compiles, which crates it adds, which tables it creates, and why each operator opt-in stays off by default."
+---
+
+Features in Arcature exist to reduce compile surface, not to turn the framework into a self-assembly kit. The default feature set compiles a generated application with no extra flags. Every feature that is off by default is off for a documented reason: a parser on the request path, a migration that creates a table, a cipher somebody has to own a rotation story for, or an attack surface best kept invisible.
+
+<Note>
+  `fullstack` is not "everything". It adds `uploads`, `views`, `storage-s3`, and the tooling features (`dev-proxy`, `uag`) to the defaults, and leaves every optional subsystem (auth flows, reset links, notifications, encryption, i18n) off. Name what you want.
+</Note>
+
+## Default Features
+
+`cargo add arcature` — no extra flags — gives you these features:
+
+```toml
+[dependencies]
+arcature = "0.1"
+```
+
+| Feature | What it compiles |
+|---|---|
+| `macros` | `#[arcature::main]`, `#[arcature::controller]`, `#[arcature::request]`, the Tokio runtime |
+| `dx` | The unified DSL: `module!`, `application!`, `routes!`, `#[service]`, `#[resource]`, `#[page]`, `ApplicationGraph`, `ModuleDescriptor`, `Resolve<S>` |
+| `inertia` | Native Inertia.js v3 server protocol, `Inertia` extractor, `inertia!` macro |
+| `database` + `db-postgres` | SeaORM 2.0 + SQLx 0.9 over one shared pool, migrations, PostgreSQL driver |
+| `auth` | Session management (tower-sessions), CSRF, Argon2 password hashing, `AuthManager`, `Auth<U>` extractor |
+| `validation` | `#[validate]` field attributes, `Validated<T>` extractor, RFC 9457 error bodies |
+| `cache` | Redis/Valkey client (`redis` 1.5), `Cache::remember` and related methods |
+| `storage-fs` | Filesystem-backed `Storage` via OpenDAL, `StoragePath` validation |
+| `mail` | SMTP via lettre 0.11 (rustls), `Mailable` trait, credential-safe `Debug` |
+| `jobs` | Database-backed job queue, `Registry`, `Worker`, `Scheduler`, at-least-once delivery |
+| `events` | In-process typed event dispatch, `Dispatcher`, `Event` derive |
+| `api` | RFC 9457 problem details, typed API responses |
+| `observe` | `tracing`, JSON structured logs, `x-request-id`, Prometheus text endpoint |
+| `pages` | Static file serving (`tower-http fs`), root HTML document |
+| `realtime` | WebSocket + SSE over Axum, per-process fan-out |
+| `cli` | The `arc` binary (clap 4), file watcher (`notify` 8) |
+| `templates` | Application scaffold templates used by `arc new` |
+
+## The `fullstack` Group
+
+`fullstack` extends the defaults with:
+
+```toml
+arcature = { version = "0.1", features = ["fullstack"] }
+```
+
+| Added feature | What it adds beyond default |
+|---|---|
+| `storage-s3` | S3-compatible object storage via OpenDAL (reqwest HTTP transport) |
+| `dev-proxy` | Vite IPC forwarding for the one-port dev topology |
+| `uag` | Unified Application Graph — `arc typegen`, `arc routes`, `arc build` |
+| `uploads` | Multipart bodies, magic-byte content sniffing (`infer`), unicode filename normalisation |
+| `views` | Compiled Askama HTML templates (no runtime parser) |
+
+## Optional Subsystems
+
+These features are off by default. Each description says why.
+
+<Accordion title="auth-flows — Constant-time login, throttling, password confirmation">
+
+```toml
+features = ["auth-flows"]
+```
+
+Adds `auth::flows`: constant-time account lookup (prevents timing-based enumeration of valid email addresses), login throttling, and password confirmation. Implies `auth` and `signed-urls`.
+
+**Why it's off:** An application with no login screen should not carry login-screen code. An application that has a login screen and does not enable this feature gets one that is wrong in a way nothing reports — an account lookup that skips the hash when the address is unknown turns response time into an enumeration oracle.
+
+**Cost:** No new crates beyond what `auth` and `signed-urls` already pull.
+
+</Accordion>
+
+<Accordion title="auth-reset — One-time password-reset links">
+
+```toml
+features = ["auth-reset"]
+```
+
+One-time password-reset links stored as SHA-256 digests, redeemable exactly once. Implies `auth-flows` and `database`.
+
+**Why it's off:** Creates a table and a migration. Applications provisioned by an administrator or reset through a support desk have no use for it.
+
+**Costs:** One new table (`password_resets`). `dep:sha2`, `dep:subtle` (constant-time comparison), `dep:zeroize` (wipes plaintext on drop) — all already in the dependency graph when `auth` or `uploads` is on.
+
+</Accordion>
+
+<Accordion title="auth-remember — Rotating remember-me tokens with theft detection">
+
+```toml
+features = ["auth-remember"]
+```
+
+Long-lived remember-me credentials with token rotation and theft detection. A stolen token that is presented after rotation invalidates the family. Implies `auth-flows` and `database`.
+
+**Why it's off:** Creates a table and a migration. "Stay signed in" is a product decision — an application whose sessions should end when the browser closes should not carry the schema for one that doesn't.
+
+**Costs:** One new table (`remember_tokens`). Same crypto dependencies as `auth-reset`.
+
+</Accordion>
+
+<Accordion title="api-tokens — Hashed personal access tokens">
+
+```toml
+features = ["api-tokens"]
+```
+
+Opaque bearer credentials for clients without a cookie or session — CLIs, CI jobs, service-to-service calls. Stored as SHA-256 digests; requires `database`.
+
+**Why it's off:** Creates a table and a migration. An application that only serves a browser never needs one.
+
+**Costs:** One new table (`personal_access_tokens`). `dep:sha2`, `dep:subtle`, `dep:zeroize` — no new crates on a build that already has `auth`.
+
+</Accordion>
+
+<Accordion title="crypt — XChaCha20-Poly1305 application-level encryption">
+
+```toml
+features = ["crypt"]
+```
+
+`Encrypter`: authenticated encryption over a versioned, self-describing token. The cipher is XChaCha20-Poly1305 (192-bit nonce — safe for random draws at any volume). Subkeys are derived per-purpose from `APP_KEY`; the master key never reaches an algorithm directly.
+
+**Why it's off:** Enabling it is the moment an application decides it can produce ciphertext — and the moment someone has to own a key rotation story. `dep:chacha20poly1305` pulls pure-Rust RustCrypto code, no C.
+
+**Costs:** `dep:chacha20poly1305`, `dep:hmac`, `dep:sha2`, `dep:secrecy`, `dep:zeroize`.
+
+</Accordion>
+
+<Accordion title="signed-urls — HMAC-signed, expiring links">
+
+```toml
+features = ["signed-urls"]
+```
+
+`UrlSigner`: links that carry their own origin proof and expiry deadline. Signatures are compared in constant time (`dep:subtle`).
+
+**Why it's separate from `crypt`:** Signing needs a MAC; encrypting needs a cipher. An application that only wants a one-hour download link should not pull an AEAD into its graph.
+
+**Costs:** `dep:hmac`, `dep:sha2`, `dep:subtle`, `dep:secrecy`, `dep:zeroize`, `dep:percent-encoding` (already present when `mail` is on).
+
+</Accordion>
+
+<Accordion title="session-store-db — Sessions in your database">
+
+```toml
+features = ["session-store-db"]
+```
+
+Stores sessions in the application's own database so a deploy does not log everyone out. Session IDs are stored as SHA-256 digests, never as the raw cookie value.
+
+**Why it's off:** Creates a table and a migration. Implies `auth` and `database`.
+
+**Costs:** One new table (`sessions`). `dep:sha2`, `dep:async-trait`.
+
+</Accordion>
+
+<Accordion title="notifications — Multi-channel notification delivery">
+
+```toml
+features = ["notifications"]              # mail channel only
+features = ["notifications-db"]           # + in-app inbox table
+features = ["notifications-broadcast"]    # + live push over WebSocket/SSE
+features = ["notifications-queue"]        # hand mail delivery to the job queue
+```
+
+`notifications` implies `mail`. Each additional channel is its own feature because each adds a cost a mail-only user should not pay.
+
+| Sub-feature | Cost |
+|---|---|
+| `notifications-db` | One new table (`notifications`), requires `database` |
+| `notifications-broadcast` | Requires `realtime`; fanout is per-process |
+| `notifications-queue` | Requires `jobs`; mail is at-least-once |
+
+**Why the queue channel is separate:** Enabling it changes where the work happens. An application with no worker process should not be offered a method that writes rows nobody drains.
+
+</Accordion>
+
+<Accordion title="uploads — Multipart file upload handling">
+
+```toml
+features = ["uploads"]
+```
+
+Multipart request bodies, filename sanitisation (unicode normalisation to NFC, then reserved-name check), content-addressed storage names, and magic-byte content sniffing (`dep:infer`). Rejects oversized uploads before buffering. Implies `validation` and `storage-fs`.
+
+**Why it's off:** An upload endpoint is the largest attacker-authored surface a web application has — the filename, content type, and byte count all come from the client. A build with no upload route has no business carrying a multipart parser.
+
+**Costs:** `dep:unicode-normalization`, `dep:sha2`, `dep:infer`, `axum/multipart`.
+
+</Accordion>
+
+<Accordion title="views — Compiled Askama HTML templates">
+
+```toml
+features = ["views"]
+```
+
+Server-rendered HTML views compiled to Rust at build time. There is no runtime template parser, so server-side template injection is structurally absent — an expression evaluator in the request path does not exist to be exploited.
+
+**Why it's off:** A generated Arcature application renders through Inertia. Views are for applications that want HTML from the server, and a build that never renders one has no business carrying a template compiler.
+
+**Cost:** `dep:askama` (proc-macro + derive, pure Rust). Editing a template requires a rebuild.
+
+</Accordion>
+
+<Accordion title="i18n — Fluent localisation catalogs">
+
+```toml
+features = ["i18n"]
+```
+
+Mozilla Fluent translation catalogs with CLDR plural categories, gender selectors, and locale-aware formatting. Catalog files are loaded at startup from the filesystem; they are never supplied by a request.
+
+**Why it's off:** An application that ships one language should not carry a message parser and a plural-rule table.
+
+**Costs:** `dep:fluent-bundle`, `dep:unic-langid`. The subtree does include `self_cell`, which contains `unsafe`; `src/i18n/mod.rs` documents the boundary that makes it acceptable.
+
+</Accordion>
+
+## Database Drivers
+
+Exactly one driver belongs in a given build. `database` alone — without a driver — produces a build that cannot connect to anything, which is intentional: it lets one crate serve all three without a SQLite user compiling the PostgreSQL protocol.
+
+```toml
+# Pick one:
+features = ["db-postgres"]   # default
+features = ["db-sqlite"]
+features = ["db-mysql"]
+```
+
+| Feature | Driver crates activated |
+|---|---|
+| `db-postgres` | `sqlx/postgres`, `sea-orm/sqlx-postgres`, `sea-orm-migration/sqlx-postgres` |
+| `db-sqlite` | `sqlx/sqlite`, `sea-orm/sqlx-sqlite`, `sea-orm-migration/sqlx-sqlite` |
+| `db-mysql` | `sqlx/mysql`, `sea-orm/sqlx-mysql`, `sea-orm-migration/sqlx-mysql` |
+
+The job queue uses different claim strategies per dialect. PostgreSQL uses `UPDATE .. RETURNING` over `FOR UPDATE SKIP LOCKED`; MySQL uses `SKIP LOCKED` without `RETURNING`; SQLite serialises on `BEGIN IMMEDIATE`. SQLite's implementation is single-writer by design — correct for one process, not for a fleet.
+
+## Operator Opt-Ins
+
+These features stay off by default because their cost or exposure is something an operator should decide deliberately.
+
+| Feature | Why it's opt-in |
+|---|---|
+| `otel` | OTLP trace exporter stack is large; most applications never enable it |
+| `api-docs` | Publishes an interactive API reference at `/_arcature/docs` — a map of the attack surface |
+| `storage-s3` | Pulls reqwest + OpenDAL S3 transport |
+| `oauth` | OAuth 2.0 Authorization Code + PKCE; `dep:oauth2` + `dep:url` |
+| `dev-proxy` | Vite IPC forwarding; only needed when `arc dev` topology is in use |
+| `uag` | The Unified Application Graph (needed for `arc typegen`, `arc routes`, `arc build`) |
+
+## Test Kit
+
+```toml
+[dev-dependencies]
+arcature = { version = "0.1", features = ["test-kit"] }
+```
+
+`test-kit` is a dev-dependency feature. It adds `TestApp`, the fluent HTTP client, assertions, and fakes (in-memory session store). Never enable it under `[dependencies]`.
+

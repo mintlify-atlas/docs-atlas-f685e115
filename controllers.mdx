@@ -1,0 +1,302 @@
+---
+title: "Controllers and Handlers in Arcature — Full Reference"
+sidebarTitle: "Controllers"
+description: "Write handlers as free functions or structs, use Arcature and Axum extractors, build responses with four builders, and group controllers into modules."
+---
+
+A handler in Arcature is an ordinary `async fn`. Nothing forces you to use a controller struct — `Route::get("/", index)` accepts a free function just as happily as a method reference. Controllers are a convention for grouping related handlers into one `impl` block, and the `#[arcature::controller]` macro makes that struct a first-class citizen in the framework's static metadata system.
+
+## Free functions vs. controller structs
+
+Both forms are valid Axum handlers and compile to the same thing at runtime. The choice is organisational.
+
+<Tabs>
+  <Tab title="Free function">
+    ```rust
+    use arcature::prelude::*;
+
+    pub async fn index() -> Result<Response> {
+        Ok(text(StatusCode::OK, "hello"))
+    }
+
+    pub async fn show(Path(id): Path<i64>) -> Result<Response> {
+        Ok(text(StatusCode::OK, format!("link {id}")))
+    }
+    ```
+  </Tab>
+  <Tab title="Controller struct">
+    ```rust
+    use arcature::prelude::*;
+
+    pub struct LinksController;
+
+    #[arcature::controller]
+    impl LinksController {
+        pub async fn index() -> Result<Response> {
+            Ok(text(StatusCode::OK, "all links"))
+        }
+
+        pub async fn show(Path(id): Path<i64>) -> Result<Response> {
+            Ok(text(StatusCode::OK, format!("link {id}")))
+        }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## What `#[arcature::controller]` adds
+
+The `impl` block is emitted unchanged. `LinksController::index` is still a plain `async fn` that a test can call directly. Alongside it the macro emits `impl ControllerMetadata`, whose `METHODS` const carries one entry per handler: the method name, its parameter names, and the page it renders (when declared).
+
+```rust
+use arcature::ControllerMetadata;
+
+let methods = <LinksController as ControllerMetadata>::METHODS;
+assert_eq!(methods[0].name, "index");
+assert_eq!(methods[1].params, ["id"]);
+```
+
+`METHODS` is `&'static`. Nothing registers itself at startup; the array is the whole registry.
+
+## The contract the macro enforces
+
+Every method in the `impl` block must be:
+
+- **`pub`** — an Axum handler is a free function; private methods are not handlers.
+- **`async`** — Axum's handler contract requires a future.
+- **Declared with a return type** — the macro reads it to derive page identity.
+- **Free of a `self` receiver** — Axum handlers take no `self`.
+
+Breaking any of these produces `error[ARC-M004]` at the offending method, not a page of trait-bound noise.
+
+## The page edge
+
+A handler that returns `Page<T>` has its page identity read from the return type at compile time. The `#[arcature::page("Name")]` attribute on the struct declares the identity.
+
+```rust
+use arcature::prelude::*;
+
+#[arcature::page("Dashboard")]
+pub struct DashboardPage {
+    pub title: String,
+    pub item_count: u32,
+}
+
+#[arcature::page("Reports")]
+pub struct ReportsPage {
+    pub rows: Vec<ReportRow>,
+}
+
+pub struct DashboardController;
+
+#[arcature::controller]
+impl DashboardController {
+    /// Returns Page<DashboardPage> — page identity derived from the return type.
+    pub async fn index() -> Page<DashboardPage> {
+        arcature::dx::page(DashboardPage {
+            title: "Dashboard".to_string(),
+            item_count: 0,
+        })
+    }
+
+    /// Explicit #[page] attribute when returning a non-Page type.
+    #[page("Reports")]
+    pub async fn reports() -> Result<Response> {
+        Ok(text(StatusCode::OK, "reports"))
+    }
+}
+```
+
+`methods[0].page` is `Some("Dashboard")`, derived from the signature, never from the body. The derivation compiles to `<T>::PAGE_CONTRACT.name()`, a const that exists only for `#[page]` types — so a handler that tries to return a non-page type as a page fails to compile. Any other return shape (`Response`, `Json<T>`, `String`, `impl IntoResponse`) yields `page: None`.
+
+## Extractors
+
+Handler arguments are Axum extractors, unchanged, because the router is Axum's.
+
+```rust
+use arcature::axum::extract::{Path, Query, State};
+use arcature::prelude::*;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+pub struct LinkQuery {
+    pub q: Option<String>,
+}
+
+pub async fn index(
+    State(state): State<AppState>,
+    Query(query): Query<LinkQuery>,
+) -> Result<Response> {
+    Ok(json(&query.q))
+}
+
+pub async fn show(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Response> {
+    Ok(json(&id))
+}
+```
+
+Arcature adds its own extractors on top of Axum's:
+
+| Extractor | What it provides |
+|---|---|
+| `Auth<U>` | The currently authenticated user (errors on unauthenticated) |
+| `OptionalAuth<U>` | `Option<U>` — absent is fine |
+| `Current<U>` | Alias for `Auth<U>` in some contexts |
+| `Session` | The session map for reading and writing session data |
+| `Flash` | One-time flash messages from the previous request |
+| `CsrfToken` | The current CSRF token (for embedding in forms) |
+| `Validated<T>` | JSON body, deserialized and validated |
+| `ValidatedForm<T>` | Form body, deserialized and validated |
+| `ValidatedQuery<T>` | Query string, deserialized and validated |
+| `RequestCache` | Per-request memoization store |
+
+## Response builders
+
+Four builders cover the common response shapes.
+
+| Builder | Result |
+|---|---|
+| `text(StatusCode::OK, "hello")` | `text/plain` response |
+| `json(&value)` | `application/json` response, always status 200 |
+| `no_content()` | 204 No Content |
+| `redirect().to("/dashboard")` | 303 See Other (or 308 after `.permanent()`) |
+
+<Warning>
+`json` takes one argument — the value — and always produces status 200. If you need a different status, build the response directly with `axum::response::Json` or `axum::response::Response`.
+</Warning>
+
+## The `redirect()` builder
+
+`redirect()` returns a builder, not a `Response`. The full chain:
+
+```rust
+use arcature::prelude::*;
+
+// Simple redirect — finish with into_response() inside a Result<Response> handler:
+Ok(redirect().to("/links").into_response())
+
+// Named route — resolved via the application's route table:
+Ok(redirect().route("links.show", 42).into_response())
+
+// Back to the previous page (reads the Referer header):
+Ok(redirect().back().into_response())
+
+// With flash data written to the session:
+Ok(redirect()
+    .to("/links")
+    .with("status", "saved")
+    .into_response())
+
+// Permanent redirect (308):
+Ok(redirect().to("/new-path").permanent().into_response())
+```
+
+`.route("links.show", 42)` and `.back()` cannot resolve until a request is available (the route table and the `Referer` header live on the request). They ride along in the response extensions; `RedirectMapper` — stage 20 of the pipeline, installed by default — completes them. An application that builds its own pipeline without `RedirectMapper` gets the fallback: a literal `.to()` path still redirects, but a named route answers **400** and flash data is dropped.
+
+<Tip>
+Redirect targets are validated against open redirects. An absolute URL pointing to a different host is rejected rather than followed.
+</Tip>
+
+## Error handling
+
+Handlers return `Result<Response>` — Arcature's `Result`, whose error type converts to an HTTP response.
+
+```rust
+use arcature::prelude::*;
+
+pub async fn show(Path(id): Path<i64>) -> Result<Response> {
+    let link = find_link(id).await.ok_or_else(|| not_found("link not found"))?;
+    if !link.published {
+        return Err(forbidden("not accessible"));
+    }
+    Ok(json(&link))
+}
+```
+
+| Builder | Status | Use case |
+|---|---|---|
+| `not_found("msg")` | 404 | Resource does not exist |
+| `bad_request("msg")` | 400 | Malformed input that passed validation |
+| `forbidden("msg")` | 403 | Authorisation failure |
+| `Problem` | configurable | RFC 9457 problem document with custom type and extensions |
+
+The pipeline's error-mapping stage (stage 11) gives a body to errors that were returned bodiless, and in release builds it redacts 5xx detail rather than leaking it to the client.
+
+## Complete controller example
+
+The following controller illustrates the full range: Axum extractors, Arcature extractors, all four response builders, redirect with flash, and the page edge.
+
+```rust
+use arcature::axum::extract::{Path, State};
+use arcature::prelude::*;
+
+#[arcature::page("links/show")]
+pub struct ShowLinkPage {
+    pub link: LinkResource,
+}
+
+pub struct LinksController;
+
+#[arcature::controller]
+impl LinksController {
+    /// GET /links
+    pub async fn index(State(state): State<AppState>) -> Result<Response> {
+        let db = state.db.as_ref().ok_or_else(|| not_found("no database"))?;
+        let links = link::Entity::query(db).latest().limit(20).all().await?;
+        Ok(json(&links))
+    }
+
+    /// GET /links/{id}
+    pub async fn show(
+        State(state): State<AppState>,
+        Path(id): Path<i64>,
+    ) -> Result<Page<ShowLinkPage>> {
+        let db = state.db.as_ref().ok_or_else(|| not_found("no database"))?;
+        let link = link::Entity::find_by_id(id)
+            .one(db)
+            .await?
+            .ok_or_else(|| not_found("link not found"))?;
+        Ok(arcature::dx::page(ShowLinkPage {
+            link: LinkResource::from(link),
+        }))
+    }
+
+    /// POST /links
+    pub async fn store(
+        input: Validated<StoreLinkRequest>,
+    ) -> Result<Response> {
+        let data = input.into_inner();
+        // ... persist data ...
+        Ok(redirect()
+            .to("/links")
+            .with("status", "created")
+            .into_response())
+    }
+
+    /// DELETE /links/{id}
+    pub async fn destroy(Path(id): Path<i64>) -> Result<Response> {
+        // ... delete link ...
+        Ok(no_content())
+    }
+}
+```
+
+## Grouping controllers into a module
+
+`module!` names the controllers, services, jobs, and listeners that belong together and aggregates their `&'static` metadata into one `ModuleDescriptor`.
+
+```rust
+arcature::module! {
+    pub Links {
+        controllers: [LinksController],
+    }
+}
+
+let descriptor = links_module();
+assert_eq!(descriptor.controllers, ["LinksController"]);
+```
+
+The descriptor is built entirely from the `&'static` consts the macros emit. There is no runtime container, no dependency resolver, and no `TypeId` lookup. `arc make:module <name>` writes the block, a controller, a service, and a routes table into one directory.

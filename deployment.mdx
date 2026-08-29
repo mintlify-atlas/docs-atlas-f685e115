@@ -1,0 +1,207 @@
+---
+title: "Deploying Arcature Applications to Production"
+sidebarTitle: "Deployment"
+description: "Release builds, the request pipeline stage order, health endpoints, startup and shutdown sequencing, multi-instance concerns, security headers, and port resolution."
+---
+
+An Arcature application is one binary that listens on one TCP port. There is no separate Node process, no PHP-FPM pool, and no asset server. What you deploy is the binary, the built frontend assets, and whatever the application reads from the environment.
+
+## Building for release
+
+```bash
+cargo build --release
+```
+
+Feature selection controls what enters the binary. The default feature set is batteries-included and compiles the generated application with no extra flags. `fullstack` adds `uploads`, `views`, `storage-s3`, and the tooling features (`cli`, `templates`, `dev-proxy`, `uag`) to the defaults, but deliberately leaves every optional subsystem off — so a `fullstack` build still has no password-reset table, no encrypter, and no notifications.
+
+Database drivers are separate features — `db-postgres`, `db-sqlite`, `db-mysql` — and exactly one belongs in a build. Enabling `database` alone gives a build that cannot connect to anything, which is intentional: it is the only way one crate serves all three drivers without a SQLite user compiling the Postgres protocol.
+
+`api-docs` in particular publishes a map of your attack surface; name it explicitly only in builds meant to produce that document.
+
+## The request pipeline
+
+Every request travels through a fixed, ordered stack. The order is a contract written in `src/application/pipeline.rs` and asserted by the test suite — it does not depend on the order builder methods were called.
+
+| # | Stage | Notes |
+|---|---|---|
+| 1 | `DevProxy` | Forwards Vite requests in development. Pass-through in production. |
+| 2 | `Proxy` | Pre-routing URI rewriting. |
+| 3 | `Health` | Merged beside the router, not layered over it. |
+| 4 | `UagEndpoint` | Merged beside the router. Debug builds only. |
+| 5 | `Compression` | Sees the final body, whoever produced it. |
+| 6 | `SecurityHeaders` | Outside body limit and timeout — a `413` and `408` carry security headers too. |
+| 7 | `CORS` | Answers a preflight without waking anything below. |
+| 8 | `RequestId`, `TraceContext` | Every response carries `x-request-id`. Outside admission stages. |
+| 9 | `AccessLog`, `Metrics` | Outside panic catcher, body limit, timeout, rate limiter — a `500`, `413`, `408`, and `429` are all logged and counted. |
+| 10 | `CatchPanic` | A panic becomes a `500`, not a dropped connection. |
+| 11 | `ErrorMapping` | RFC 9457 bodies for bodiless errors; release redaction. |
+| 12 | `BodyLimit` | Rejects an oversized upload before buffering it. |
+| 13 | `Timeout` | A slow handler cannot hold a connection open. |
+| 14 | `Maintenance` | Outside session and CSRF. |
+| 15 | `RateLimit` | Inside maintenance, outside the session. |
+| 16 | `Session` | Loaded before CSRF needs the token. |
+| 17 | `CSRF` | An unsafe request is rejected before it can act. |
+| 18 | `Inertia` | Innermost framework layer. |
+| 19 | `PageContracts` | Data, not behaviour. |
+| 20 | `RedirectMapper` | Finalises `redirect().route(..)` against the route table and session. |
+| 21 | user `.layer()`s | Applied in call order, innermost. |
+| 22 | Router | Route matching and the handler. |
+| 23 | `StaticFiles` | The router's fallback. |
+
+Stages 5 through 21 are **off unless asked for** (except `RedirectMapper`, which is always on). An application that calls only `.routes()` gets a bare router plus the health endpoints.
+
+<Tip>
+User `.layer()` calls land at stage 21 — inside the body limit, timeout, maintenance gate, and rate limiter. A request refused with `413`, `408`, `503`, or `429` never reaches stage 21. Use the dedicated builder methods (`.metrics()`, `.trace_context()`, `.access_log()`) to install layers at their correct stage where they see every request.
+</Tip>
+
+## Health endpoints
+
+Three endpoints are mounted under `/up` by default. `.health_prefix("/healthz")` moves them; `.health(false)` removes them.
+
+| Path | Question | Answered from |
+|---|---|---|
+| `GET /up/live` | Is this process alive? | The lifecycle alone — never touches a database, cache, or the network. |
+| `GET /up/ready` | Should this process receive traffic? | The lifecycle **and** every started subsystem's probe. |
+| `GET /up` | The same, as JSON for a human. | Both. |
+
+<Warning>
+Do not wire a restart policy to readiness. A database blip restarts the pod, and the restart does not bring the database back. Point liveness probes at `/up/live` and load-balancer health checks at `/up/ready`.
+</Warning>
+
+These three endpoints bypass maintenance mode and always answer `application/json` with `Cache-Control: no-store`. Readiness is `false` before startup completes — the health handle holds the subsystem set in a `OnceLock` that startup fills in.
+
+## Startup and shutdown order
+
+`run_with_state` starts subsystems in a fixed order and tears them down in reverse:
+
+```text
+start:  database -> jobs -> cache -> storage -> mail
+serve:  mark ready, accept connections
+drain:  begin_drain (readiness turns 503, requests in flight continue)
+stop:   mail -> storage -> cache -> jobs -> database
+```
+
+The drain step is why the readiness endpoint exists in its current form. `begin_drain` runs *before* the listener stops, so `/up/ready` answers `503` while in-flight requests are still being served. That window is exactly what a load balancer needs to take the instance out of rotation without dropping connections.
+
+`SIGTERM` and Ctrl-C both trigger graceful shutdown on Unix; on Windows only Ctrl-C is wired. `serve(listener)` is the escape hatch: it takes an already-bound listener and skips ordered startup entirely.
+
+## Running multiple instances
+
+Most of the framework is indifferent to process count. Three subsystems are not:
+
+**Sessions** are shared if you configure a shared store. The `session-store-db` feature puts sessions in the same database the application already uses, so a request landing on any instance continues the session and a deploy does not log everyone out. `MemoryStore` does neither.
+
+**Rate limiting** is per-process until you point it at Redis. With *n* instances behind a load balancer, a client gets roughly *n* times the nominal quota from the default in-memory backend. `RateLimit::redis(cache)` (needs the `cache` feature) moves the buckets to Redis/Valkey and makes the quota global.
+
+<Warning>
+**A per-hour quota keyed by address is the one combination that costs throughput.** The in-memory backend sweeps its bucket table past 8 192 entries and drops buckets that have refilled to capacity. Under a per-hour quota a bucket stays ineligible for six minutes, so the sweep drops nothing, the table keeps growing, and every subsequent request rescans it while holding a blocking mutex.
+
+Measured at 128 connections: a fresh key on every request costs nothing under a per-second quota and **5.6× throughput** under a per-hour one — 6 786 req/s against 1 201 req/s. `RateLimit::redis(cache)` avoids this entirely. Failing that, prefer a faster-refilling spelling of the same rate: `per_minute(600)` and `per_hour(10)` allow nearly the same traffic over an hour, but the first refills a spent bucket in a tenth of a second.
+</Warning>
+
+**Realtime fan-out is per-process, with no cross-instance switch.** `Broadcast` wraps a `tokio::sync::broadcast` channel — a channel between tasks inside one process. A message published on instance A reaches only the WebSocket and SSE subscribers connected to instance A. Nothing errors and nothing warns; subscribers on instance B simply never see it.
+
+Three honest options:
+
+- **Run one instance.** Vertical scale goes a long way and eliminates the problem.
+- **Pin realtime connections to one instance.** Route WebSocket and SSE upgrades to a single backend while ordinary HTTP scales out.
+- **Publish from a shared source.** Have each instance subscribe to an external source (a database, a queue) and re-publish locally.
+
+## Maintenance mode
+
+`Maintenance` is an `Arc`-backed handle, not a global and not a file on disk:
+
+```rust
+use arcature::http::Maintenance;
+
+let maintenance = Maintenance::new();
+
+// From an admin route, a signal handler, or a test:
+maintenance.engage();
+
+// Allow specific paths through:
+maintenance.allow("/status");
+```
+
+Everything except the health endpoints and any path passed to `Maintenance::allow` gets a `503` with a `Retry-After` header and an RFC 9457 body. An application that does not hold the handle cannot engage maintenance mode — that is the intended trade: no ambient switch that another part of the process can flip.
+
+## Errors in release
+
+`ErrorMapping::new()` with `.redact_errors(true)` replaces `text/plain` 5xx bodies with a generic problem document. The layer sits at stage 11, inside the panic catcher and outside everything that runs application code, so it catches both handler errors and the bodiless `404`, `405`, `408`, and `413` that Axum and `tower-http` emit on their own.
+
+Redaction is a builder flag, not an automatic consequence of a release build — set it explicitly.
+
+## Security headers
+
+`SecurityHeaders::new()` sets three baseline headers:
+
+- `X-Content-Type-Options: nosniff`
+- `X-Frame-Options: DENY`
+- `Referrer-Policy: strict-origin-when-cross-origin`
+
+```rust
+use arcature::http::SecurityHeaders;
+
+Application::<AppState>::new()
+    .security_headers(
+        SecurityHeaders::new()
+            .with_hsts()
+            .with_csp("default-src 'self'; script-src 'self'")?
+    )
+```
+
+`.with_hsts()` adds `Strict-Transport-Security: max-age=31536000; includeSubDomains`. Add HSTS only once TLS is terminated in front of the process and you are prepared for the one-year commitment, subdomains included.
+
+`.with_csp(policy)` sets a Content-Security-Policy from a string you supply. `.with_csp_nonce(template)` substitutes a fresh 144-bit random value on every request:
+
+```rust
+SecurityHeaders::new()
+    .with_hsts()
+    .with_csp_nonce("default-src 'self'; script-src 'self' 'nonce-{nonce}'")?
+```
+
+A template with no `{nonce}` placeholder is refused at construction. The nonce goes into request extensions before anything else runs. The framework stamps it onto every element it emits itself: the Inertia data-page script, module script, and stylesheet links. Elements your application writes itself must carry the nonce explicitly — read it in a handler by extracting `CspNonce` or `Option<CspNonce>`.
+
+<Note>
+Do not let a shared cache store nonce'd HTML. The document and header are cached together so they stay consistent, but every visitor then gets a nonce every other visitor already knows, which defeats its purpose entirely. Arcature sets no `Cache-Control` on the initial document; excluding it is the CDN configuration's job.
+</Note>
+
+## Port resolution
+
+The listen port is resolved at startup in priority order:
+
+| Priority | Source |
+|---|---|
+| 1 (highest) | `ARCATURE_BACKEND_PORT` |
+| 2 | `PORT` |
+| 3 | `APP_PORT` |
+| 4 (lowest) | `.config(..)` or `.port(..)`, defaulting to `1183` |
+
+The first that parses as a `u16` wins. A variable that is present but malformed (e.g. `PORT=` in a compose file) is skipped rather than fatal — an empty variable does not prevent the process from booting.
+
+`ARCATURE_BACKEND_PORT` ranks highest because `arc dev` sets it and its supervisor owns the process's only TCP listener. If `PORT` outranked it, a stale `PORT` in a developer's `.env` would aim the child at an address the supervisor already holds.
+
+`AppConfig::from_env()` reads `APP_NAME`, `APP_URL`, `APP_ENV`, and `APP_PORT`. Hand the result to `.config(..)` to wire them into the application. `APP_URL` is used through `AppConfig::absolute_url(path)` — the accessor for building links outside a request context (password resets, `redirect_uri`, signed URLs). The path is joined, never substituted, so a path that looks like a URL of its own becomes a path segment under the configured host rather than a link to another origin.
+
+<Warning>
+`APP_ENV` is **deliberately barred from gating behaviour**. Every protection that could plausibly key off an environment — security headers, HSTS, error redaction, the UAG endpoint — keys off `cfg!(debug_assertions)` instead, so it is decided when the binary is built. An `APP_ENV` that could switch protections off would let whoever can set an environment variable downgrade a production binary without redeploying it.
+</Warning>
+
+## Continuous integration
+
+CI runs on both the MSRV (`1.97.1`) and `stable`, with `RUSTFLAGS: -D warnings` and a `postgres:17` service. The gates, in order:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets
+cargo build
+cargo test
+cargo build --no-default-features
+cargo build --features fullstack
+cargo hack check --each-feature --no-dev-deps
+cargo hack build --feature-powerset --skip database --keep-going
+```
+
+The feature-matrix jobs catch the most common kind of feature-gating bug: a feature that only compiles when another one happens to be enabled alongside it. `cargo hack` is the only tool that finds it systematically. A separate job runs `cargo publish --dry-run --no-verify`.
+
+The `justfile` at the repository root wraps these as `just check`, `just fmt`, `just lint`, `just test`, `just features`, and `just docs`.

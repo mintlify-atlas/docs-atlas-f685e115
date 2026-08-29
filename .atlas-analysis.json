@@ -1,0 +1,139 @@
+{
+  "projectType": "framework",
+  "projectName": "Arcature",
+  "projectDescription": "An opinionated full-stack Rust web framework that integrates Axum, Inertia.js, SeaORM, and a batteries-included CLI — one crate, one port, zero ceremony.",
+  "theme": "aspen",
+  "primaryColor": "#B34A14",
+  "lightColor": "#F4E4D8",
+  "darkColor": "#1A0A04",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Guide",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "getting-started",
+              "first-module",
+              "dev-loop"
+            ]
+          },
+          {
+            "group": "Handling Requests",
+            "pages": [
+              "routing",
+              "controllers",
+              "validation",
+              "inertia",
+              "views-and-i18n"
+            ]
+          },
+          {
+            "group": "Data Layer",
+            "pages": [
+              "database",
+              "cache",
+              "storage"
+            ]
+          },
+          {
+            "group": "Auth & Security",
+            "pages": [
+              "authentication",
+              "api-tokens",
+              "oauth",
+              "encryption"
+            ]
+          },
+          {
+            "group": "Background Work",
+            "pages": [
+              "jobs",
+              "events",
+              "mail",
+              "notifications",
+              "realtime"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "observability",
+              "api-and-openapi",
+              "deployment",
+              "testing",
+              "upgrading"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "CLI Commands",
+            "pages": [
+              "reference/cli",
+              "reference/make-commands"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "reference/features",
+              "reference/pipeline",
+              "reference/env"
+            ]
+          },
+          {
+            "group": "Design Decisions",
+            "pages": [
+              "reference/decisions"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Axum-powered HTTP routing with named routes, groups, and per-scope middleware",
+    "Native Inertia.js v3 server implementation — React, Vue, and Svelte, no npm package required",
+    "SeaORM + SQLx database layer supporting PostgreSQL, MySQL, and SQLite from one pool",
+    "Client Exposure Firewall: compile-time proof that only opt-in types reach the browser",
+    "Built-in auth: Argon2id password hashing, session management, CSRF, policies, OAuth 2 + PKCE",
+    "Database-backed job queue with fenced claims, retry policies, and a per-dialect claim strategy",
+    "In-process event dispatcher, mailer, notifications, and WebSocket/SSE realtime channels",
+    "OpenDAL-backed file storage (local filesystem and S3-compatible), with path traversal prevention",
+    "Structured JSON logging, Prometheus metrics, W3C Trace Context, and OTLP span export",
+    "RFC 9457 Problem Details for all error responses",
+    "TypeScript code generation from the application graph (typed routes, page props, form rules)",
+    "arc CLI: scaffold, dev loop with hot-reload on one port, migrations, typegen, and build"
+  ],
+  "publicApiSurface": [
+    "arcature::prelude::* (Application, Routes, Route, RouteGroup)",
+    "#[arcature::main] — async entry point macro",
+    "ApplicationBuilder: .routes(), .database(), .cache(), .storage(), .mail(), .jobs(), .inertia(), .build()",
+    "routes! { } macro — typed route declarations with named URL helpers",
+    "#[arcature::controller] — handler impl block macro",
+    "#[arcature::request] — validated request body macro",
+    "#[arcature::page(\"name\")] / #[arcature::resource] — Client Exposure Firewall macros",
+    "#[derive(arcature::Job)] / #[derive(arcature::Event)] — derive macros for queue and events",
+    "Auth<U>, OptionalAuth<U>, AuthManager<U>, Session, Flash, CsrfToken — auth extractors",
+    "Validated<T>, ValidatedForm<T>, ValidatedQuery<T> — validated extractors",
+    "Inertia extractor + inertia!() macro",
+    "Bound<T> — route model binding extractor",
+    "text(), json(), redirect(), no_content() — response builders",
+    "Problem::of(kind) / Problem::custom(type_uri, status) — RFC 9457 error responses",
+    "arcature::database::{Db, QueryModel, Transaction, insert, update, delete, find_by_pk}",
+    "arcature::cache::{Cache, CacheConfig, Namespace}",
+    "arcature::storage::{Storage, StorageConfig, StoragePath}",
+    "arcature::mail::{Mail, Mailable, Mailer}",
+    "arcature::jobs::{Jobs, JobRequest, Registry, Worker, Scheduler}",
+    "arcature::observe::{install_logging, Metrics, MetricsLayer, TraceContextLayer, JsonLog}",
+    "arcature::auth::{PasswordHasher, verify_password, SessionConfig, CsrfConfig}",
+    "arcature::test_kit::{TestApp, TestServer, TestRequest, TestResponse}",
+    "arc new / arc dev / arc serve / arc migrate / arc make:<kind> / arc typegen / arc build"
+  ]
+}

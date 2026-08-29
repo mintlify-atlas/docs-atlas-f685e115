@@ -1,0 +1,255 @@
+---
+title: "API Tokens: Hashed Bearer Credentials for Arcature"
+sidebarTitle: "API Tokens"
+description: "Opaque bearer tokens for CLI and CI clients: plaintext shown once, SHA-256 stored, scoped abilities, mandatory expiry, and constant-time hash verification."
+---
+
+The `api-tokens` feature provides opaque bearer credentials for API clients that have no cookie and no session — a CLI, a CI job, a mobile application, or another service. The client sends `Authorization: Bearer <token>` on every request, and the framework authenticates it against a stored digest without ever holding the plaintext.
+
+## Enabling the Feature
+
+```toml
+arcature = { version = "0.1", features = ["api-tokens", "db-postgres"] }
+```
+
+`api-tokens` implies `database` and nothing else — it does not imply `auth`. An API with no passwords and no sessions can issue tokens without compiling a password hasher or a session layer.
+
+## The Core Property
+
+A token is two halves: a public 16-byte ID (the lookup key) and a secret 32-byte half (the credential). The database row holds the ID in the clear and the SHA-256 of the secret. The secret itself is never written anywhere.
+
+```sql
+CREATE TABLE IF NOT EXISTS arcature_api_tokens (
+    id            BYTEA       PRIMARY KEY,
+    secret_digest BYTEA       NOT NULL,
+    tokenable_id  TEXT        NOT NULL,
+    name          TEXT        NOT NULL,
+    abilities     JSONB       NOT NULL,
+    expires_at    TIMESTAMPTZ NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+```
+
+<Note>
+There is a `secret_digest` column and no column that could hold the secret. A stolen backup, a read replica, or a reporting account yields 32 bytes of digest per token and no way to authenticate as anyone.
+</Note>
+
+The token format is `arcpat_` followed by 32 hex characters of ID, `_`, and 64 hex characters of secret — 104 characters total. `TOKEN_PREFIX` is a public constant so a secret scanner (a pre-commit hook, a CI step, a log pipeline) can recognise an Arcature token in a paste or a diff.
+
+## Issuing Tokens
+
+```rust
+use arcature::tokens::{Abilities, ApiTokens, NewApiToken};
+use std::time::Duration;
+
+let tokens = ApiTokens::new(pool.clone());
+tokens.migrate().await?;
+
+let issued = tokens
+    .issue(
+        &NewApiToken::expiring_in("user:42", "CI deploy key", Duration::from_secs(3600))
+            .abilities(Abilities::of(["deploy:write"])),
+    )
+    .await?;
+
+// Show this once. There is no second chance.
+println!("{}", issued.plaintext().expose());
+```
+
+`issue` returns an `IssuedApiToken`:
+- `token()` — the stored record
+- `plaintext()` — the credential as a `PlaintextToken`
+- `into_parts()` — takes both apart by value
+
+`PlaintextToken` is built to make an accidental second copy hard:
+
+| Property | Why |
+| --- | --- |
+| no `Clone` | a credential that is trivially copied has an unknown number of copies |
+| `Debug` prints `PlaintextToken([redacted])` | secrets reach logs through `Debug` three types up |
+| zeroized on drop | the plaintext does not linger in freed heap |
+| `expose()`, not `as_str()` | every call site reads as a decision |
+
+<Warning>
+The plaintext exists exactly once, in memory, in the `IssuedApiToken` return value. Nothing — not this module, not a `SELECT`, not a backup — can produce it again. Losing it means issuing another token.
+</Warning>
+
+### Explicit deadline vs. TTL
+
+```rust
+use arcature::tokens::NewApiToken;
+use chrono::{Duration, Utc};
+
+// Spell the deadline directly.
+let explicit = NewApiToken::new("user:42", "laptop", Utc::now() + Duration::days(30));
+
+// Or express a duration from now.
+let ttl = NewApiToken::expiring_in("user:42", "CI", std::time::Duration::from_secs(3600));
+```
+
+`NewApiToken` has no constructor without a deadline, and the column has no null state. A credential that outlives its purpose is the ordinary way a leak stays useful.
+
+## The Migration
+
+`tokens.migrate()` creates `arcature_api_tokens` and its indexes. It is idempotent and safe to run from every replica at once. Call it at startup.
+
+| Dialect | Migration lock |
+| --- | --- |
+| PostgreSQL | `pg_advisory_lock(71420003)` |
+| MySQL 8 | `GET_LOCK('arcature_api_tokens_migrate', 10)` |
+| SQLite | None — it serialises writers itself |
+
+Column types differ by dialect:
+
+| Column | PostgreSQL | MySQL 8 | SQLite |
+| --- | --- | --- | --- |
+| `id` | `BYTEA` | `BINARY(16)` | `BLOB` |
+| `secret_digest` | `BYTEA` | `BINARY(32)` | `BLOB` |
+| `tokenable_id`, `name` | `TEXT` | `VARCHAR(191)` | `TEXT` |
+| `abilities` | `JSONB` | `JSON` | `TEXT` |
+| `expires_at`, `created_at` | `TIMESTAMPTZ` | `DATETIME(6)` UTC | `INTEGER` epoch ms |
+
+## The `ApiAuth` Extractor
+
+`ApiAuth` reads the `Authorization` header, splits the credential, hashes the secret half, and compares it against the stored digest in constant time. The store reaches the extractor through an axum `Extension`:
+
+```rust
+use arcature::axum::{Extension, Router, http::StatusCode, routing::get};
+use arcature::tokens::{ApiAuth, ApiTokens};
+
+async fn deploy(ApiAuth(token): ApiAuth) -> Result<String, StatusCode> {
+    if !token.can("deploy:write") {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(format!("deploying for {}", token.tokenable_id()))
+}
+
+fn routes(tokens: ApiTokens) -> Router {
+    Router::new()
+        .route("/deploy", get(deploy))
+        .layer(Extension(tokens))
+}
+```
+
+`ApiAuth` is a tuple struct over `ApiToken`, so destructuring in the argument list is the normal spelling.
+
+### Extractor response table
+
+| Condition | Response |
+| --- | --- |
+| No `Authorization` header | `401`, `WWW-Authenticate: Bearer` |
+| Scheme other than `bearer` (case-insensitive) | `401` |
+| `Bearer` with nothing after it | `401` |
+| Header value that is not UTF-8 | `401` |
+| A credential not in the expected shape | `401`, no query made |
+| Unknown ID, wrong secret, or expired token | `401` |
+| Store never installed as an `Extension` | `500` — this is a wiring mistake |
+| Database refused the query | `503` |
+
+Every authentication failure is the same `401` with the same body. A client that can distinguish them is being told about tokens it does not hold.
+
+## Abilities
+
+A token carries a set of opaque strings. Matching is exact — there is no prefix expansion or wildcard grammar.
+
+```rust
+use arcature::tokens::Abilities;
+
+let scoped = Abilities::of(["posts:read", "posts:write"]);
+assert!(scoped.contains("posts:read"));
+assert!(!scoped.contains("billing:write"));
+
+// The one wildcard, and the only one.
+assert!(Abilities::all().contains("anything at all"));
+
+// No prefix matching — "posts:*" grants only "posts:*".
+assert!(!Abilities::of(["posts:*"]).contains("posts:read"));
+```
+
+| Constructor | Result |
+| --- | --- |
+| `Abilities::none()` | Grants nothing — the default on a `NewApiToken` |
+| `Abilities::of(iter)` | Grants exactly those strings |
+| `Abilities::all()` | The reserved `"*"`, which matches every ability |
+| `.with(ability)` | Adds one more |
+
+<Tip>
+Abilities are not checked by the extractor. `ApiAuth` proves the token is live; the route calls `can`. The check is one line of Rust and a second extractor would be a less readable way to write it.
+</Tip>
+
+The default is closed: a token minted without naming an ability grants nothing. The only permissive setting is one explicitly written as `Abilities::all()`.
+
+## Revocation and Sweeping
+
+```rust
+// Revoke one token.
+let revoked: bool = tokens.revoke(id).await?;
+
+// Revoke all tokens for a subject (e.g., after a password change).
+let count: u64 = tokens.revoke_all_for("user:42").await?;
+
+// Reclaim disk space from expired rows.
+let reclaimed: u64 = tokens.sweep_expired().await?;
+```
+
+Revocation is a `DELETE`, not a flag. A revoked row that remains in the table is one a future query can accidentally authenticate. `revoke_all_for` is the "laptop stolen" path, and the call to make when a password changes.
+
+`sweep_expired` reclaims disk space. It is not what makes expiry correct — the `expires_at > now()` predicate on every read already does that. A deployment that never calls it is secure and merely wasteful.
+
+### Listing tokens
+
+```rust
+for token in tokens.list_for("user:42").await? {
+    println!("{} ({}) expires {}", token.name(), token.id(), token.expires_at());
+}
+```
+
+`list_for` returns every live token for one subject, newest first. `find(id)` reads one by ID. Neither can return a plaintext. `ApiTokenId` is safe to log, display, and accept from a revocation request.
+
+## Why SHA-256 and Not Argon2
+
+A password hash is slow on purpose because a password is low entropy — users pick from a distribution an attacker can enumerate. The slow hash exists to make that enumeration expensive.
+
+A token secret is 32 bytes from the OS CSPRNG: 256 bits of uniform randomness with no distribution to enumerate. Adding Argon2's cost factor to an already-impossible search buys nothing — but it does cost tens of milliseconds and tens of megabytes on **every API request**, which turns any client with a valid token and a loop into a memory-hard workload generator. SHA-256 is the right call here, and Argon2 remains the right call for passwords.
+
+## Constant-Time Comparison
+
+The comparison between the presented digest and the stored one uses `subtle::ConstantTimeEq`:
+
+```rust
+let matches: bool = presented_digest.ct_eq(stored.as_slice()).into();
+```
+
+A `==` would return at the first differing byte. A few hundred nanoseconds difference, averaged over enough requests, is enough to recover a digest one byte at a time. `ConstantTimeEq` reads every byte every time.
+
+## CSRF Steps Aside for Bearer Requests
+
+`CsrfLayer` exempts any unsafe request carrying an `Authorization: Bearer` header. The check is on the scheme alone, before any token is validated — the request is then still rejected by `ApiAuth` unless it carries a live token. The exemption skips CSRF, not authentication.
+
+A route protected only by a session cookie gains nothing from a client that also sends a bearer header.
+
+## What This Module Does Not Do
+
+<Accordion title="Explicit non-features and their rationale">
+
+**No OAuth.** No authorization server, grant types, consent screen, client registration, refresh endpoint, or discovery document. The separate `oauth` feature is an OAuth 2 *client* against a third-party provider and shares no code with this module.
+
+**No refresh tokens, no rotation.** The only writes are `issue`, `revoke`, `revoke_all_for`, and `sweep_expired`. A token's expiry and abilities cannot be edited — both changes mean issuing a new token and revoking the old one.
+
+**No usage tracking.** The table has no `last_used_at` and no counter. `authenticate` performs no write.
+
+**No caching, no rate limiting.** Every authenticated request is one `SELECT`. The 256-bit secret is the whole defence against guessing.
+
+**No layer.** `ApiAuth` is a per-route extractor. There is no `ApiTokenLayer` that protects a router subtree. Install the store with `Extension` yourself.
+
+**No history.** Revocation is a `DELETE` and every read filters on expiry. There is no audit record of who revoked what.
+
+**No scheduled sweep.** `sweep_expired` runs when you call it. Wire it into a [jobs](/jobs) schedule if you want one.
+
+**No transaction variants.** Every method runs on the pool. A token cannot be issued inside a transaction you already hold.
+
+**No serde on `ApiToken`.** Rendering a token list into an Inertia prop or a JSON body means a struct of your own.
+
+**No relationship to a user row.** `tokenable_id` has no foreign key and no cascade. Deleting a user does not delete their tokens. Call `revoke_all_for`.
+
+</Accordion>

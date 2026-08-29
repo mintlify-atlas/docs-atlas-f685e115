@@ -1,0 +1,188 @@
+---
+title: "Request Validation in Arcature — Validated Extractors"
+sidebarTitle: "Validation"
+description: "Declare request structs with field-level rules, extract and validate them before handlers run, and return RFC 9457 problem responses with field errors."
+---
+
+Validation in Arcature is a trust boundary. Once a handler receives a validated value it has already passed `validator::Validate::validate` — the handler does not re-check it. Validation is also deliberately narrow in scope: a validated request is a well-formed one, not a permitted one. Authorization is a separate explicit step, covered in the auth chapter.
+
+## Declaring a request struct
+
+Annotate a struct with `#[arcature::request]` after your own `derive` attributes. The macro prepends `#[derive(::arcature::validator::Validate)]` and implements `arcature::Request` — the marker that makes the type first-class to tooling — and `arcature::RequestMetadata`, which `routes!` reads when a route declares `action: T`.
+
+```rust
+use arcature::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[arcature::request]
+pub struct StoreLinkRequest {
+    #[validate(url)]
+    pub url: String,
+
+    #[validate(length(min = 1, max = 120))]
+    pub title: String,
+
+    #[validate(email)]
+    pub contact_email: Option<String>,
+
+    #[validate(range(min = 1, max = 100))]
+    pub priority: u8,
+}
+```
+
+<Note>
+Two details that are easy to get wrong. The rule attribute is `#[validate(...)]`, not `#[rule(...)]`. And `#[arcature::request]` goes **after** your `derive` attributes — adding `Validate` before `Deserialize` would make the derive order wrong.
+</Note>
+
+You derive `Deserialize` yourself. The macro deliberately does not add it, so you can also add `Serialize` or `Debug` without a duplicate-derive error. Because the macro re-exports `validator` through Arcature, you do not need `validator` as a direct dependency.
+
+## Available validation rules
+
+The rule vocabulary is the `validator` crate's — `#[validate(...)]` is its attribute helper. The most commonly used rules:
+
+| Rule | Example | Notes |
+|---|---|---|
+| `url` | `#[validate(url)]` | Checks that the string is a well-formed URL |
+| `email` | `#[validate(email)]` | RFC 5322 email format |
+| `length` | `#[validate(length(min = 1, max = 255))]` | Works on `String`, `Vec`, slices |
+| `range` | `#[validate(range(min = 0.0, max = 1.0))]` | Numeric range, inclusive |
+| `required` | `#[validate(required)]` | Non-`None` for `Option<T>` fields |
+| `regex` | `#[validate(regex(path = *SLUG_RE))]` | Match against a static `Regex` |
+| `contains` | `#[validate(contains(pattern = "@"))]` | Substring presence |
+| `custom` | `#[validate(custom(function = "check_slug"))]` | Call your own validation fn |
+| `nested` | `#[validate(nested)]` | Recursively validate a nested `Validate` type |
+
+## Using it in a handler
+
+`Validated<T>` is the primary extractor. It reads a JSON body, deserializes it into `T`, and calls `T::validate()`. A failure never reaches the handler — it becomes a 422 response immediately.
+
+```rust
+use arcature::prelude::*;
+
+pub async fn store(input: Validated<StoreLinkRequest>) -> Result<Response> {
+    let data = input.into_inner();
+    // `data` is a StoreLinkRequest that passed all validation rules.
+    Ok(redirect().to("/links").into_response())
+}
+```
+
+## Extractor variants
+
+Four narrower extractors cover sources other than a JSON body:
+
+| Extractor | Source |
+|---|---|
+| `Validated<T>` | JSON body (delegates to `ValidatedJson<T>`) |
+| `ValidatedJson<T>` | JSON body, explicit |
+| `ValidatedForm<T>` | URL-encoded form body |
+| `ValidatedQuery<T>` | Query string parameters |
+| `ValidatedPath<T>` | Path parameters (e.g. struct capturing `{id}` and `{slug}`) |
+
+All four map extraction rejections (malformed JSON, a missing query parameter, a path segment that will not parse) to RFC 9457 problem documents, so a client always sees one error shape rather than two distinct rejection formats.
+
+For a value you already extracted yourself, `validate_or_problem(&value)` validates it and returns `Err(Problem)` on failure.
+
+## What a failure looks like
+
+A validation failure produces a 422 response with an RFC 9457 problem document. Field errors appear under an `errors` extension keyed by field name.
+
+```json
+{
+  "type": "urn:arcature:problem:validation",
+  "status": 422,
+  "detail": "Request validation failed",
+  "errors": {
+    "url": [{ "code": "url" }],
+    "title": [{ "code": "length" }],
+    "priority": [{ "code": "range" }]
+  }
+}
+```
+
+Each error entry carries a `code` — the validator rule name — which is stable across locale or message changes. Nested struct errors use dotted paths: `"address.postal_code"`.
+
+## Testing validation
+
+Test against field names and error codes, not against message strings. Message strings are not part of the public API and can change.
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arcature::validator::Validate;
+
+    #[test]
+    fn rejects_invalid_url() {
+        let req = StoreLinkRequest {
+            url: "not-a-url".to_string(),
+            title: "My Link".to_string(),
+            contact_email: None,
+            priority: 5,
+        };
+
+        let errors = req.validate().unwrap_err();
+        let field_errors = errors.field_errors();
+
+        // Assert on the field name and code, not the human-readable message:
+        assert!(field_errors.contains_key("url"));
+        assert_eq!(field_errors["url"][0].code, "url");
+    }
+
+    #[test]
+    fn rejects_empty_title() {
+        let req = StoreLinkRequest {
+            url: "https://example.com".to_string(),
+            title: "".to_string(),
+            contact_email: None,
+            priority: 5,
+        };
+
+        let errors = req.validate().unwrap_err();
+        assert!(errors.field_errors().contains_key("title"));
+    }
+
+    #[test]
+    fn accepts_valid_request() {
+        let req = StoreLinkRequest {
+            url: "https://example.com".to_string(),
+            title: "Example".to_string(),
+            contact_email: Some("admin@example.com".to_string()),
+            priority: 10,
+        };
+
+        assert!(req.validate().is_ok());
+    }
+}
+```
+
+<Tip>
+The `custom` rule lets you attach business-rule validation (uniqueness, cross-field checks) using a plain Rust function with the signature `fn check_field(value: &T) -> Result<(), ValidationError>`. Keep async checks out of validation functions — run them in the handler after extraction.
+</Tip>
+
+## Raising a validation problem by hand
+
+When you need to surface validation errors that are computed rather than derived from field attributes — for example, a uniqueness check against the database — build the problem document directly:
+
+```rust
+use arcature::prelude::*;
+use arcature::validator::{ValidationError, ValidationErrors};
+
+pub async fn store(
+    State(state): State<AppState>,
+    input: Validated<StoreLinkRequest>,
+) -> Result<Response> {
+    let data = input.into_inner();
+
+    // Check uniqueness after basic validation passes:
+    let exists = url_exists(&state, &data.url).await?;
+    if exists {
+        let mut errors = ValidationErrors::new();
+        errors.add("url", ValidationError::new("unique"));
+        return Err(arcature::validation::validation_problem(errors).into());
+    }
+
+    Ok(redirect().to("/links").into_response())
+}
+```
+
+`validation_problem(errors)` builds the same RFC 9457 document the extractors produce, so the client sees a consistent error shape regardless of whether the failure came from field rules or application logic.

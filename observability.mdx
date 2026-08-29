@@ -1,0 +1,332 @@
+---
+title: "Observability: Logs, Metrics, and Tracing"
+sidebarTitle: "Observability"
+description: "Structured JSON logs with redaction, a Prometheus metrics registry, W3C trace context propagation, and optional OTLP span export — all driven by values your application holds."
+---
+
+Arcature's observability stack is built around one rule: nothing installs itself. There is no global subscriber, no global recorder, and no global tracer provider. A `JsonLog` sink, a `Metrics` registry, and a `Telemetry` pipeline are values the application holds and clones. The subscriber is installed by a call your application makes. This design means a test can capture exactly its own output without touching a global, and a binary can compose its own subscriber without fighting anything the library already registered.
+
+## Feature flags
+
+```toml
+# Logs, request IDs, access log, Prometheus registry, trace context.
+arcature = { version = "0.1", features = ["observe"] }
+
+# The same, plus OTLP span export. `otel` implies `observe`.
+arcature = { version = "0.1", features = ["otel"] }
+```
+
+| Feature | Gives you | Pulls in |
+|---|---|---|
+| `observe` | `install_logging`, `JsonLog`, `RequestId` + `RequestIdLayer`, `AccessLogLayer`, `Metrics` + `MetricsLayer`, `TraceContext` + `TraceContextLayer`, `redact` | `tracing`, `tracing-subscriber`, `uuid` |
+| `otel` | `Telemetry`, `TelemetryBuilder`, `observe::otel` module | `observe`, `opentelemetry`, `opentelemetry_sdk`, `opentelemetry-otlp`, `tracing-opentelemetry` |
+
+`observe` is on in both `default` and `fullstack`. `otel` is an operator opt-in: four crates and the full gRPC stack enter the dependency graph, so most applications never enable it. `otel` is an addition to `observe`, never a replacement — `observe::metrics` is not gated on `otel`.
+
+## Installing the subscriber
+
+```rust
+// The first line of your `run` function, before anything that might log.
+arcature::observe::install_logging(LOG_FILTER).map_err(std::io::Error::other)?;
+```
+
+`install_logging(default_filter) -> Result<(), ObserveError>` — call it once, from `main`, before anything else logs. Events emitted without a subscriber go nowhere silently, which is the worst way for logging to be broken.
+
+The log format is determined by build profile, not an environment variable:
+
+| Build | Layer | Redaction |
+|---|---|---|
+| `debug` (`cfg!(debug_assertions)`) | `tracing_subscriber::fmt`, no ANSI, target shown | **none** |
+| `release` | `JsonLog` on `StderrSink` | every field against the deny-list |
+
+Both write to stderr so log lines never interleave with stdout. The redaction column is not a typo: a debug build prints every field verbatim, including one named `password`. An application that needs redaction during development composes its own subscriber with `JsonLog` directly (see [Sinks](#sinks)) rather than calling `install_logging`.
+
+`RUST_LOG` overrides the `default_filter` argument. A malformed value falls back to the default with a warning on stderr — a typo in a log filter must not prevent a process from booting.
+
+## Log line format
+
+One JSON object per line, no pretty-printing, no trailing state. Every mainstream log shipper reads it without configuration.
+
+```json
+{"fields":{"client_ip":"203.0.113.9","duration_ms":7,"method":"GET","path":"/dashboard","request_id":"6f1e6f8c-6e5e-4a2b-9a24-6f3a2f0f1c77","status":200},"level":"INFO","message":"GET /dashboard 200 7ms","target":"arcature::observe::access_log","timestamp":"2026-08-23T10:15:04.220Z"}
+```
+
+| Key | Present | Value |
+|---|---|---|
+| `timestamp` | always | RFC 3339 UTC, millisecond precision, always `Z` |
+| `level` | always | `TRACE` / `DEBUG` / `INFO` / `WARN` / `ERROR` |
+| `target` | always | the emitting module path |
+| `message` | when recorded | the formatted message, lifted out of `fields` |
+| `spans` | inside an entered span | span names, outermost first |
+| `fields` | when at least one exists | event fields plus inherited span fields |
+
+Keys are serialised from a `BTreeMap`, so they appear in alphabetical order. Span fields are folded into each event, with a nested span's field beating its parent's and the event's own field beating both. `JsonLog::without_span_fields()` drops inherited fields and logs only what the event itself recorded.
+
+## Sinks
+
+`LogSink` exposes one method — `write_line(&self, line: &str)` — that delivers a complete log line without its terminator. It is a trait rather than `std::io::Write` because a sink is shared across threads and must serialise whole lines.
+
+| Sink | Use |
+|---|---|
+| `StderrSink` | standard error, one `writeln!` under the lock |
+| `CaptureSink` | keeps lines in memory; cloning shares the buffer |
+
+`CaptureSink` is how a test asserts on its own log output without touching a global:
+
+```rust
+use arcature::observe::{CaptureSink, JsonLog};
+use tracing_subscriber::layer::SubscriberExt as _;
+
+let sink = CaptureSink::new();
+let subscriber = tracing_subscriber::registry().with(JsonLog::new(sink.clone()));
+tracing::subscriber::with_default(subscriber, || {
+    tracing::info!(user = "ada", password = "hunter2", "signed in");
+});
+assert!(sink.transcript().contains("[redacted]"));
+```
+
+`lines()` returns the `Vec<String>`, `transcript()` joins them. A poisoned mutex is recovered from in both sinks so a panic in one log call does not silence every later one.
+
+## Request IDs
+
+`RequestIdLayer` resolves one identifier per request and writes it back as the `x-request-id` response header. This header name is wire-compatible with reverse proxies and client libraries, so it requires no special configuration to survive a proxy hop.
+
+| Property | Detail |
+|---|---|
+| Source | the inbound `x-request-id` header, if it parses; otherwise a fresh UUID v4 |
+| Allowed charset | ASCII alphanumerics plus `-` `_` `.` `:` `@` `+` `/` `=` |
+| Maximum length | `MAX_REQUEST_ID_BYTES`, 128 bytes |
+| On rejected input | a fresh ID is generated — rejection is never surfaced as an error |
+| Response header | `x-request-id`, on every response the layer sees |
+
+Hostile input is replaced rather than rejected because failing a request over a malformed correlation ID would be a denial-of-service with no upside.
+
+Both layers are opt-in on the builder:
+
+```rust
+Application::new()
+    .request_id()   // stage 8
+    .access_log()   // stage 9
+```
+
+## Access log
+
+One `tracing` event per request, at `INFO`, from `arcature::observe::access_log`. The message is `"{method} {path} {status} {duration}ms"` and the structured fields are:
+
+| Field | Type | Value |
+|---|---|---|
+| `method` | string | the HTTP method |
+| `path` | string | `uri.path()` — path only, never the query string |
+| `status` | number | response status as `u16` |
+| `duration_ms` | number | whole milliseconds, truncated |
+| `request_id` | string | the resolved ID, or `""` if `RequestIdLayer` did not run |
+| `client_ip` | string | the resolved `ClientIp`, or `""` if nothing resolved one |
+
+The query string is intentionally absent. Applications routinely place credentials in query strings — OAuth codes, PKCE verifiers, password-reset tokens — and `AccessLogService` records `uri.path()` only. The access log layer sits outside the panic catcher, body limit, and timeout, so a `500`, a `413`, and a `408` are all logged.
+
+## Metrics
+
+`Metrics` is a registry the application owns and clones. Two `Metrics` values are two independent registries; cloning shares one, so the handle given to a middleware and the handle given to the `/metrics` route are the same set of series.
+
+| Method | Does |
+|---|---|
+| `Metrics::new()` | empty registry with `DEFAULT_BUCKETS` |
+| `Metrics::with_buckets(&[..])` | same, with your histogram bounds — sorted on entry, non-finite values dropped |
+| `describe_counter/gauge/histogram(name, help)` | attach `# TYPE` and `# HELP` for a name |
+| `increment(name, labels, by)` | add to a counter series |
+| `set(name, labels, value)` | set a gauge series |
+| `observe(name, labels, value)` | record one histogram observation |
+| `counter_value(name, labels)` | `Option<u64>`, for test assertions |
+| `render()` | the whole registry as Prometheus text |
+| `response()` | the same, as an HTTP response with the correct content type |
+
+Labels are stored in a `BTreeMap`, so `[("a","1"),("b","2")]` and `[("b","2"),("a","1")]` are one series, not two.
+
+`MetricsLayer` records two series per request:
+
+| Name | Type | Labels | Help |
+|---|---|---|---|
+| `http_requests_total` | counter | `method`, `status` | Total HTTP requests handled. |
+| `http_request_duration_seconds` | histogram | `method` | HTTP request duration in seconds. |
+
+`DEFAULT_BUCKETS`, in seconds: `0.005`, `0.01`, `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1.0`, `2.5`, `5.0`, `10.0`.
+
+### Stage 9, not stage 21
+
+<Warning>
+Using `.layer(MetricsLayer::new(..))` places the layer at **stage 21** — inside the body limit, the timeout, the maintenance gate, and the rate limiter. A request refused with a `413`, `408`, `503`, or `429` never reaches stage 21, so a counter installed there silently means "requests that got through admission." The access log at stage 9 will disagree with it, and the gap is widest under exactly the load an incident is about.
+
+Use `ApplicationBuilder::metrics(registry)` instead. It installs the same layer at stage 9, beside the access log, where it sees every request the access log sees.
+</Warning>
+
+```rust
+let metrics = Metrics::new();
+
+let app = Application::<AppState>::new()
+    .routes(routes())
+    .rate_limit(RateLimit::per_minute(60))
+    .metrics(metrics.clone())   // stage 9: counts the 429s too
+    .build();
+```
+
+The `/metrics` route is your application's responsibility — the framework provides no default route and no default access control for it.
+
+## Trace context
+
+`TraceContextLayer` reads W3C Trace Context headers off inbound requests, places a `TraceContext` in extensions, and opens an `arcature.request` span carrying the trace IDs so log lines can be joined to the trace.
+
+`traceparent` validation rules:
+
+| Rule | Detail |
+|---|---|
+| Length | exactly 55 bytes, dashes at positions 2, 35, and 52 |
+| Version | `00` only — `ff` and any other value are rejected |
+| Hex case | lowercase only |
+| Trace ID | 16 bytes, all-zero rejected |
+| Parent ID | 8 bytes, all-zero rejected |
+| Flags | one octet; bit 0 is `FLAG_SAMPLED` |
+
+`tracestate` validation rules:
+
+| Rule | Detail |
+|---|---|
+| Maximum length | 512 bytes |
+| Maximum members | 32 (`MAX_TRACESTATE_MEMBERS`) |
+| Byte range | printable ASCII `0x20`–`0x7e` |
+| Without a valid `traceparent` | dropped — it describes a trace this request is not part of |
+
+A malformed `traceparent` is discarded and a fresh root trace is started, because half a trace ID silently corrupts every trace it joins. `tracestate` is stored as original text: the only operations performed on it are "carry it forward" and "prepend our own member."
+
+The span carries three fields:
+
+| Field | Meaning |
+|---|---|
+| `trace_id` | 32 lowercase hex characters |
+| `parent_span_id` | 16 lowercase hex characters |
+| `continued_trace` | `true` if an upstream trace was joined; `false` if this is a root |
+
+For a downstream call, `context.outbound_headers()` returns a `HeaderMap` with a `traceparent` whose span ID is a fresh child, plus the `tracestate` if one survived validation.
+
+Use `.trace_context()` on the builder (stage 8) rather than `.layer(TraceContextLayer)` (stage 21), for the same reason as metrics: a refused request should still carry a trace.
+
+## OTLP export
+
+With the `otel` feature, `Telemetry` is an OTLP-over-gRPC span pipeline:
+
+```rust
+use std::time::Duration;
+use arcature::observe::{JsonLog, StderrSink, Telemetry};
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
+
+let telemetry = Telemetry::builder("checkout")
+    .endpoint("http://collector:4317")
+    .timeout(Duration::from_secs(5))
+    .build()?;
+
+tracing_subscriber::registry()
+    .with(JsonLog::new(StderrSink))
+    .with(telemetry.tracing_layer())
+    .init();
+
+// ... run the application ...
+
+telemetry.shutdown()?;
+```
+
+| Property | Detail |
+|---|---|
+| Service name | required — never defaulted |
+| Transport | gRPC over tonic (`grpc-tonic` only) |
+| Signals | traces only — `opentelemetry` is pinned with `trace`, not `metrics` or `logs` |
+| Resource attributes | `service.name` only |
+| Runtime | a Tokio runtime must already be running when `build()` is called |
+| Shutdown | `Telemetry::shutdown` flushes the buffer; dropping without it loses buffered spans |
+| Sampling | none configured; the SDK default applies |
+
+When `.endpoint(..)` is not called, `build()` does not call `with_endpoint` at all, so `opentelemetry-otlp`'s own default applies — which reads `OTEL_EXPORTER_OTLP_ENDPOINT`. `observe::otel::DEFAULT_ENDPOINT` documents the local collector address (`http://127.0.0.1:4317`) but nothing in `build()` passes it.
+
+When `otel` is on and the request carried a usable `traceparent`, the layer calls `set_parent` with a remote `SpanContext` built from the parsed IDs — so the exported span is part of the caller's trace rather than a disconnected root. This call happens before the span is entered because `set_parent` refuses with `AlreadyStarted` afterwards.
+
+## Redaction
+
+`JsonLog` asks `redact::is_sensitive` about every field name before serialising it. A field that matches is written as `"[redacted]"` — a fixed marker rather than an omission, so a reader can tell "this field was withheld" from "this field was never recorded."
+
+Redaction operates in exactly two files: `json_log.rs` (every event field and every span field) and `access_log.rs` (the `client_ip` value). All other channels are unredacted:
+
+| Channel | Redacted | Note |
+|---|---|---|
+| JSON log, event field | yes | name is matched, value is replaced |
+| JSON log, span field | yes | redacted when the span is created |
+| JSON log, message string | **no** | the deny-list catches field names, not sentences |
+| Debug-build console (`fmt`) | **no** | `install_logging` only installs `JsonLog` in release |
+| Metric label value | **no** | escaped for the exposition format, not redacted |
+| Exported OTLP span attribute | **no** | `tracing_opentelemetry` has its own visitor |
+
+<Warning>
+Metric label values and OTLP span attributes are **not redacted**. A field named `password` recorded on a `tracing` span will be written as `[redacted]` to the JSON log and exported to the collector in full. A metric series labelled with a `session_id` will render that value on `/metrics`. Treat both channels as unredacted, and keep secrets out of them — or record them as a type whose `Debug` impl renders `[redacted]`.
+</Warning>
+
+### How a name is matched
+
+`redact::is_sensitive(field: &str) -> bool` runs three steps:
+
+1. Every `-` and `.` becomes `_`.
+2. Every other character is ASCII-lowercased.
+3. The result is tested for **containment** of any needle in `DENY_LIST`.
+
+Substring matching is intentional: `password`, `user_password`, and `db.password` are all the same mistake. Separator folding is intentional: `x-api-key` and `api_key` both match `api_key`.
+
+### DENY_LIST reference
+
+| | | | |
+|---|---|---|---|
+| `access_token` | `api_key` | `apikey` | `auth` |
+| `bearer` | `bind` | `body` | `cache_value` |
+| `card` | `cookie` | `credential` | `csrf` |
+| `cvv` | `id_token` | `otp` | `passphrase` |
+| `passwd` | `password` | `payload` | `pin_code` |
+| `private_key` | `pwd` | `refresh_token` | `secret` |
+| `session_id` | `signature` | `sql_args` | `token` |
+| `verifier` | | | |
+
+Because matching is by containment, some ordinary field names are redacted as collateral:
+
+| Field name | Redacted by |
+|---|---|
+| `author`, `authority` | `auth` |
+| `wildcard`, `discard`, `cardinality` | `card` |
+| `binding` | `bind` |
+| `body_bytes` | `body` |
+| `token_count` | `token` |
+
+### The camelCase gap
+
+The deny-list is written in `snake_case`, and camelCase words have no separator to fold. `privateKey` lowercases to `privatekey`; the needle is `private_key`; there is no match.
+
+| Spelling | Result | Why |
+|---|---|---|
+| `x-api-key`, `X-Api-Key` | redacted | `-` folds to `_`, matching `api_key` |
+| `http.request.header.authorization` | redacted | `.` folds, and `auth` matches |
+| `apiKey` | redacted | `apikey` is on the list as its own needle |
+| `accessToken` | redacted | the single-word needle `token` matches |
+| `privateKey` | **not redacted** | `privatekey` does not contain `private_key` |
+| `sessionId` | **not redacted** | `sessionid` does not contain `session_id` |
+
+If your application records JSON body keys under the names the client chose, check those names against `DENY_LIST` in a test of your own, or normalise them before recording.
+
+## Stable span name constants
+
+Seven `&'static str` constants at `arcature::observe`, with `is_stable(name)` and `ALL` for iteration:
+
+| Constant | Value | Opened by the framework |
+|---|---|---|
+| `REQUEST` | `arcature.request` | yes — `AccessLogService` and `TraceContextService` |
+| `DB_QUERY` | `arcature.db.query` | no |
+| `CACHE_GET` | `arcature.cache.get` | no |
+| `JOB_HANDLE` | `arcature.job.handle` | no |
+| `PAGE_RENDER` | `arcature.page.render` | no |
+| `EVENT_LISTENER` | `arcature.event.listener` | no |
+| `SCHEDULE_TICK` | `arcature.schedule.tick` | no |
+
+Six of the seven are reserved names rather than spans anything currently emits. They exist so that instrumentation added later — in the framework or in an application — agrees on one spelling instead of inventing a second.

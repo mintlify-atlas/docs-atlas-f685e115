@@ -1,0 +1,246 @@
+---
+title: "Getting Started with Arcature in Under Five Minutes"
+sidebarTitle: "Quickstart"
+description: "Install the arc CLI, scaffold your first application with SQLite, and reach a running dev server on one port — no containers, no credentials."
+---
+
+Arcature ships as a single crate with a companion CLI tool called `arc`. The fastest path is to install the binary, run `arc new`, and let `arc dev` handle the rest: migrations run automatically, SQLite is created on first connect, and the backend and Vite share a single port so you never juggle addresses. This page covers everything from installing `arc` to understanding the generated project structure and the `ApplicationBuilder` API at its core.
+
+## Requirements
+
+- **Rust 1.97.1 or newer** (edition 2024). `rust-toolchain.toml` pins `stable`.
+- **Node.js**, for the frontend a generated project ships with.
+
+Nothing else for the default SQLite database — the driver creates the file on first connect. PostgreSQL 17 or MySQL 8 are only needed if you ask for them with `arc new --db postgres`.
+
+## Install and run
+
+<Steps>
+  <Step title="Install the arc CLI">
+    Pick one of the three install methods below. All three produce the same binary.
+
+    <Tabs>
+      <Tab title="Download (recommended)">
+        Grab the archive for your platform from the [releases page](https://github.com/ArcatureLabs/Arcature/releases/latest), unpack it, and put `arc` on your `PATH`.
+
+        Linux, macOS, and Windows are available for x86-64 and arm64, each with a `.sha256` checksum. No toolchain required — takes seconds.
+      </Tab>
+      <Tab title="cargo install">
+        ```bash
+        cargo install arcature --features cli --locked
+        ```
+
+        A full release build of the framework, including SeaORM and SQLx. Takes minutes.
+
+        <Warning>
+          `--locked` is not optional. Without it Cargo ignores the published lockfile and re-resolves dependencies, which currently selects a `sea-schema` version that fails to build with `can't find crate for async_trait`.
+        </Warning>
+      </Tab>
+      <Tab title="cargo binstall">
+        [`cargo binstall`](https://github.com/cargo-bins/cargo-binstall) fetches the published binary instead of compiling one. Install binstall first:
+
+        ```bash
+        # Linux and macOS
+        curl -L --proto '=https' --tlsv1.2 -sSf \
+          https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
+          | bash
+        ```
+
+        Then:
+
+        ```bash
+        cargo binstall arcature
+        ```
+
+        <Note>
+          Do **not** use `cargo install cargo-binstall`. That builds binstall from source — more crates than compiling Arcature — which defeats the purpose.
+        </Note>
+      </Tab>
+    </Tabs>
+
+    Verify the install:
+
+    ```bash
+    arc version
+    # arcature 0.1.3
+    ```
+  </Step>
+
+  <Step title="Create a new project">
+    ```bash
+    arc new my-app
+    ```
+
+    `arc new` writes a Laravel-shaped project, mints `APP_KEY` into `.env`, installs the frontend's npm dependencies, and configures SQLite. Pass `--stack vue` or `--stack svelte` to choose a different frontend, and `--db postgres` or `--db mysql` for a different database driver:
+
+    ```bash
+    arc new my-app --stack vue --db postgres
+    ```
+
+    Pass `--no-install` to skip npm if you are offline; run `arc install` inside the project later when you have a connection. `arc dev` refuses to start without the frontend dependencies and says so clearly rather than letting Node throw an obscure module-resolution error.
+  </Step>
+
+  <Step title="Start the dev server">
+    ```bash
+    cd my-app
+    arc dev
+    ```
+
+    ```text
+      Arcature 0.1.3
+
+      Local:    http://127.0.0.1:1183
+      Network:  use --host to expose
+    ```
+
+    `arc dev` applies any pending migrations, builds the application, starts Vite in middleware mode, and serves both on one port. Nothing else needs to be started.
+  </Step>
+</Steps>
+
+<Warning>
+**Known issue in 0.1.3:** The React stack has a Vite preamble bug that prevents `arc dev` from serving. Use `--stack vue` or `--stack svelte` until this is fixed. See the [introduction](/introduction#known-issues-in-013) for details.
+</Warning>
+
+## Using Arcature as a library
+
+Most people want the CLI above. To add Arcature to a crate you already have:
+
+```bash
+cargo add arcature
+```
+
+To follow `main` ahead of a release, take a git dependency and pin a revision — a branch reference will move under you:
+
+```toml
+[dependencies]
+arcature = { git = "https://github.com/ArcatureLabs/Arcature", rev = "abc1234" }
+```
+
+## The smallest application
+
+Before looking at a generated project, here is the minimum surface to understand what `Application`, `ApplicationBuilder`, and `run_with_state` each do:
+
+```rust
+use arcature::application::EngineResult;
+use arcature::prelude::*;
+
+#[arcature::main]
+async fn main() -> EngineResult<()> {
+    Application::new()
+        .routes(Routes::new([Route::get("/", index).name("home")]))
+        .build()
+        .run()
+        .await
+}
+
+async fn index() -> Result<Response> {
+    Ok(text(StatusCode::OK, "hello"))
+}
+```
+
+Three things to notice here:
+
+- **`.build()` is required.** `Application::new()` returns an `ApplicationBuilder`. `.run()` lives on the resulting `Application`. Omitting `.build()` is a type error, not a runtime surprise.
+- **`EngineResult<()>` is not in the prelude.** It lives at `arcature::application::EngineResult`. Engine failures (a port already bound, a database that will not connect) are a different kind of failure from a handler's and deliberately do not share an error type with `Result<Response>`.
+- **`text`, `json`, `redirect`, `no_content`** are the response builders. `json` always answers `200`; use `text(status, body)` when the status matters.
+
+## Generated project layout
+
+`arc new` writes a Laravel-shaped project rather than a single file:
+
+```text
+app/
+  controllers/   models/     services/
+  requests/      policies/   resources/
+bootstrap/
+  app.rs         state.rs
+config/
+database/migrations/
+routes/mod.rs
+resources/js/    resources/css/
+public/
+storage/
+src/main.rs      src/lib.rs
+tests/smoke.rs
+.env
+```
+
+`bootstrap/app.rs` is the composition root. It loads `.env`, reads typed configuration, and wires the subsystems into an `ApplicationBuilder`:
+
+```rust
+pub fn app() -> Result<Application<crate::bootstrap::AppState>> {
+    dotenvy::dotenv().ok();
+    let config = crate::config::load()?;
+    Ok(Application::new()
+        .routes(crate::routes::routes())
+        .bind(&config.bind_addr)
+        .port(config.port)
+        .database(config.database)
+        .cache(config.cache)
+        .storage(config.storage)
+        .mail(config.mail)
+        .jobs(jobs_registry())
+        .build())
+}
+```
+
+`bootstrap/state.rs` defines `AppState` — the cloneable bundle every handler reaches through `State<AppState>`. Each field is an `Option` because a subsystem that was never configured contributes `None` rather than panicking:
+
+```rust
+#[derive(Clone)]
+pub struct AppState {
+    pub db: Option<Db>,
+    pub jobs: Option<Jobs>,
+    pub cache: Option<Cache>,
+    pub storage: Option<Storage>,
+    pub mail: Option<Mailer>,
+}
+```
+
+The state is produced after startup from the started `Resources`, which is why it is a closure rather than a value:
+
+```rust
+pub fn state_fn() -> Arc<dyn Fn(&Resources, &Lifecycle) -> AppState + Send + Sync> {
+    Arc::new(|res, _lc| AppState {
+        db: res.db().cloned(),
+        jobs: res.jobs().cloned(),
+        cache: res.cache().cloned(),
+        storage: res.storage().cloned(),
+        mail: res.mail().cloned(),
+    })
+}
+```
+
+`src/lib.rs` puts the two together with `run_with_state`, which wires the state factory into the application before handing control to the runtime.
+
+## Feature flags
+
+Arcature's features reduce compile surface; they are not a self-assembly kit. `default` is a working full-stack application. Turn features *off* to compile less, not on to reach a usable state.
+
+```toml
+# The whole framework (includes uploads, views, storage-s3, and CLI tooling).
+arcature = { version = "0.1", features = ["fullstack"] }
+
+# An API-only server: no Inertia, no static assets pipeline.
+arcature = { version = "0.1", default-features = false, features = ["api", "database", "auth", "validation"] }
+```
+
+Database drivers are split so a SQLite application does not compile the PostgreSQL protocol. `database` alone brings the crates but no driver; exactly one of `db-postgres`, `db-sqlite`, or `db-mysql` belongs in a build.
+
+<Tip>
+The job queue uses dialect-specific claim strategies. PostgreSQL uses `UPDATE … RETURNING` with `FOR UPDATE SKIP LOCKED`; MySQL 8 picks then marks (no `RETURNING`); SQLite serialises on `BEGIN IMMEDIATE`. SQLite's strategy is a single-writer design — correct for one process, not a fleet.
+</Tip>
+
+## Next steps
+
+<CardGroup cols={3}>
+  <Card title="First Module" icon="box" href="/first-module">
+    Add a feature to your app with `arc make:module` — four files, zero boilerplate, routes serving immediately.
+  </Card>
+  <Card title="Dev Loop" icon="arrows-rotate" href="/dev-loop">
+    What `arc dev` does, why it uses one port, the rebuild timing breakdown, and how to run `arc doctor`.
+  </Card>
+  <Card title="Routing" icon="route" href="/routing">
+    Named routes, route groups, middleware, and how the route table is assembled at boot.
+  </Card>
+</CardGroup>

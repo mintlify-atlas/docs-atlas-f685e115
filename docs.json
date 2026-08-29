@@ -1,72 +1,112 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "Arcature",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
-  },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "pages": [
-      {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
-        ]
-      }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
+    "primary": "#B34A14",
+    "light": "#F4E4D8",
+    "dark": "#1A0A04"
   },
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/ArcatureLabs/Arcature"
     }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/ArcatureLabs/Arcature"
     }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Guide",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "getting-started",
+              "first-module",
+              "dev-loop"
+            ]
+          },
+          {
+            "group": "Handling Requests",
+            "pages": [
+              "routing",
+              "controllers",
+              "validation",
+              "inertia",
+              "views-and-i18n"
+            ]
+          },
+          {
+            "group": "Data Layer",
+            "pages": [
+              "database",
+              "cache",
+              "storage"
+            ]
+          },
+          {
+            "group": "Auth & Security",
+            "pages": [
+              "authentication",
+              "api-tokens",
+              "oauth",
+              "encryption"
+            ]
+          },
+          {
+            "group": "Background Work",
+            "pages": [
+              "jobs",
+              "events",
+              "mail",
+              "notifications",
+              "realtime"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "observability",
+              "api-and-openapi",
+              "deployment",
+              "testing",
+              "upgrading"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "CLI Commands",
+            "pages": [
+              "reference/cli",
+              "reference/make-commands"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "reference/features",
+              "reference/pipeline",
+              "reference/env"
+            ]
+          },
+          {
+            "group": "Design Decisions",
+            "pages": [
+              "reference/decisions"
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

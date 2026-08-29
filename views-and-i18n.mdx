@@ -1,0 +1,355 @@
+---
+title: "Compiled HTML Views and Fluent i18n in Arcature Apps"
+sidebarTitle: "Views & i18n"
+description: "Serve compiled Askama templates with no runtime parser, and add Fluent catalogs with per-request locale negotiation against a registered whitelist."
+---
+
+Arcature offers two complementary rendering strategies. Inertia handles the application — the screens behind sign-in where a JavaScript client is already loaded. Compiled views handle everything that must work with no JavaScript at all: a marketing page, an unsubscribe confirmation, an error fallback. The two mix freely in one application. Internationalization is a separate opt-in feature that plugs into both, putting the negotiated locale where each renderer can reach it.
+
+## Compiled HTML views
+
+The `views` feature renders HTML from Askama templates. `#[derive(Template)]` reads the `.html` file when the crate compiles and emits the `write!` calls that produce the page. What ships in the binary is a function, not template text. At runtime there is no parser to reach, no evaluator to abuse, and no template text in the binary to be substituted.
+
+### Enabling the feature
+
+```toml
+arcature = { version = "0.1", features = ["views"] }
+```
+
+| Context | State |
+|---|---|
+| Framework `default` | off |
+| Framework `fullstack` | on |
+| `arc new` generated application | on |
+
+### Writing a view
+
+A view is a struct whose fields are the values its template names. The `askama = arcature::askama` key points the derive at the re-exported askama crate so the application does not need its own `askama` dependency at a potentially different version.
+
+```rust
+use arcature::view::Template;
+
+/// `templates/welcome.html`
+#[derive(Template)]
+#[template(path = "welcome.html", askama = arcature::askama)]
+pub struct WelcomeView {
+    pub title: String,
+    pub message: String,
+}
+```
+
+`path` resolves against `templates/` in the crate root — askama's default directory.
+
+For a short template, write it inline with `source` and `ext`:
+
+```rust
+use arcature::view::{Template, view};
+
+#[derive(Template)]
+#[template(
+    source = "<h1>{{ title }}</h1><p>{{ message }}</p>",
+    ext = "html",
+    askama = arcature::askama
+)]
+struct WelcomeInline {
+    title: String,
+    message: String,
+}
+
+let html = view(WelcomeInline {
+    title: "Hello".into(),
+    message: "World".into(),
+})
+.render()
+.unwrap();
+```
+
+### Template syntax
+
+Templates use askama's Jinja2-like syntax. The scaffold ships a base layout and one page that extends it.
+
+<Tabs>
+  <Tab title="templates/layout.html">
+    ```html
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{% block title %}Acme{% endblock %}</title>
+      </head>
+      <body>
+        {% block content %}{% endblock %}
+      </body>
+    </html>
+    ```
+  </Tab>
+  <Tab title="templates/welcome.html">
+    ```html
+    {% extends "layout.html" %}
+
+    {% block title %}{{ title }}{% endblock %}
+
+    {% block content %}
+    <main>
+      <h1>{{ title }}</h1>
+      <p>{{ message }}</p>
+    </main>
+    {% endblock %}
+    ```
+  </Tab>
+</Tabs>
+
+### Generating a view with `arc make:view`
+
+```bash
+arc make:view admin/receipt
+```
+
+This writes two files together, because askama reads the template at compile time — a struct whose `path` names a missing file is a compile error, not a scaffold with a gap.
+
+| File | Contents |
+|---|---|
+| `app/views/admin/receipt_view.rs` | `pub struct ReceiptView` with the `#[template]` attribute |
+| `templates/admin/receipt.html` | A template extending `layout.html` |
+
+### Rendering a view as a response
+
+`view(template)` wraps a template value and implements `IntoResponse`.
+
+```rust
+use arcature::prelude::*;
+use crate::app::views::WelcomeView;
+
+pub struct HomeController;
+
+#[controller]
+impl HomeController {
+    pub async fn welcome(State(state): State<AppState>) -> Result<Response> {
+        Ok(view(WelcomeView {
+            title: state.app_name.clone(),
+            message: "Rendered on the server.".to_string(),
+        })
+        .into_response())
+    }
+}
+```
+
+`View<T>` carries three properties you can override:
+
+| Property | Default | Setter |
+|---|---|---|
+| HTTP status | `200 OK` | `.status(StatusCode)` |
+| Content-Type | `text/html; charset=utf-8` | `.content_type(HeaderValue)` |
+| `Content-Language` | absent | `.in_locale(&Locale)` (requires `i18n`) |
+
+HTML is the default rather than a guess from the template's extension. A `.txt` or `.xml` template must declare its content type explicitly:
+
+```rust
+use arcature::axum::http::HeaderValue;
+use arcature::prelude::*;
+
+let response = view(robots_template)
+    .content_type(HeaderValue::from_static("text/plain; charset=utf-8"))
+    .into_response();
+```
+
+### Escaping
+
+Escaping is selected by the template's extension at compile time. HTML extensions (`html`, `htm`, `svg`, `xml`, and others) apply the HTML escaper, which replaces `"`, `&`, `'`, `<`, and `>` with entities. Text extensions (`txt`, `md`, `none`) do not escape. An unrecognised extension is a **compile error** — not a silent fall-through to no escaping.
+
+<Warning>
+The HTML escaper is not context-aware. It escapes the same five characters whether a value lands in body text, an attribute, a URL, or inside a `<script>` block. Three consequences: (1) `href="{{ url }}"` does not protect against `javascript:` URLs — check the scheme in Rust. (2) Do not interpolate request data into `<script>` bodies. (3) Unquoted attributes like `<div class={{ value }}>` are injectable through a space. Quote every attribute.
+</Warning>
+
+### Costs of compiled templates
+
+<Accordion title="Editing a template requires a rebuild">
+There is no reload. A change to `templates/welcome.html` reaches a running process only after the crate is compiled again. `cargo build` does notice — askama emits an `include_bytes!` for every template file it reads, so touching the `.html` alone triggers a recompile on the next `cargo build`. But `arc dev` does not watch template files; touch any `.rs` file or run `cargo build` to pick up a template change.
+</Accordion>
+
+<Accordion title="A Dockerfile must COPY templates before cargo build">
+`templates/` is a source directory in the same sense `src/` is — the compiler reads it, not the process. The runtime stage can omit it entirely; the build stage must copy it before `cargo build`:
+
+```dockerfile
+COPY src ./src
+COPY app ./app
+COPY templates ./templates
+RUN cargo build --release --locked
+```
+</Accordion>
+
+<Accordion title="Enable observe alongside views">
+`ViewError` sends its detail to `tracing::error!`. `tracing` arrives with the `observe` feature, and `views` does not imply it. In a build with `views` but without `observe`, a render failure discards the askama message silently — the client gets a `500` and the operator gets nothing. Enable `observe` with `views`.
+</Accordion>
+
+---
+
+## Internationalization with Fluent
+
+The `i18n` feature adds Mozilla Fluent translation catalogs and per-request locale negotiation. Fluent handles plurals correctly for all CLDR languages, grammatical agreement, and locale-aware number formatting — things a `HashMap<String, String>` cannot do.
+
+### Enabling the feature
+
+```toml
+arcature = { version = "0.1", features = ["i18n"] }
+```
+
+Unlike `views`, `i18n` is off everywhere including `fullstack`. `arc new` scaffolds nothing for it. There is no `Application::i18n(..)` builder — wiring is manual.
+
+<Note>
+`i18n` names live at `arcature::i18n::`. Nothing is re-exported into the prelude. A handler that takes `Locale` writes `use arcature::i18n::Locale;` even with the prelude imported.
+</Note>
+
+### Writing a catalog
+
+`Catalog::parse(locale, ftl)` turns `.ftl` source into a catalog. In an application the source is `include_str!` — the bytes are in the binary and the parse is a startup cost.
+
+```rust
+use arcature::i18n::{Catalog, LocaleId};
+
+let english = Catalog::parse(
+    LocaleId::parse("en")?,
+    include_str!("../locales/en.ftl"),
+)?;
+```
+
+A sample `.ftl` file demonstrating plural forms:
+
+```
+# locales/en.ftl
+greeting = Hello, { $name }!
+files-count = { $count ->
+    [one] { $count } file
+   *[other] { $count } files
+}
+```
+
+Use `catalog.with_source(more_ftl)` to fold additional source files into the same catalog. It refuses to redefine a message or term the catalog already has — a silent overwrite would make a key's meaning depend on load order.
+
+### Registering locales
+
+`Catalogs` is the registry and the whitelist. It is the only answer in the framework to "is this a locale this application supports?".
+
+```rust
+use arcature::i18n::{Catalog, Catalogs, LocaleId};
+
+let en = LocaleId::parse("en")?;
+let fr = LocaleId::parse("fr")?;
+
+let catalogs = Catalogs::new(
+    Catalog::parse(en.clone(), include_str!("../locales/en.ftl"))?,
+)
+.with(Catalog::parse(fr.clone(), include_str!("../locales/fr.ftl"))?);
+```
+
+`Catalogs::new` takes the default locale's catalog — a registry whose default has no catalog is not spellable. `Catalogs` is `Clone` with catalogs behind an `Arc`, so a copy per request costs only a refcount bump.
+
+### Message fallback
+
+Two levels of fallback operate independently:
+
+- **Locale fallback** (negotiation): an unregistered locale becomes the default.
+- **Message fallback** (`Catalogs::translate`): a key missing from the chosen catalog is looked up in the default catalog before the call fails.
+
+A partially-translated locale renders a new string in English rather than returning a 500.
+
+### Installing the locale layer
+
+```rust
+use arcature::i18n::{LocaleLayer, LocaleNegotiator};
+
+Application::new()
+    .routes(routes())
+    .layer(LocaleLayer::new(
+        LocaleNegotiator::new(catalogs)
+            .query_parameter("lang"),  // opt-in: ?lang= override
+    ))
+    .build()
+```
+
+`LocaleNegotiator::session_key("locale")` enables reading from a session key as well. Both overrides are off by default — an application that has not opted into `?lang=` cannot have a user's locale changed by a link someone emailed them.
+
+### Locale negotiation precedence
+
+| Source | Origin | Default state |
+|---|---|---|
+| `LocaleSource::Url` | `?lang=` query parameter | **off** — opt-in with `.query_parameter("lang")` |
+| `LocaleSource::Session` | Session key | **off** — opt-in with `.session_key("locale")` |
+| `LocaleSource::Header` | `Accept-Language` header | always read |
+| `LocaleSource::Default` | Nothing offered was registered | — |
+
+Every proposed tag goes through `LocaleId::parse` (BCP-47 validation, 35-byte max) and then a whitelist lookup in `Catalogs`. A hostile or unregistered tag selects the default — `../../etc/passwd`, `{{7*7}}`, and `<script>` all produce `LocaleSource::Default`. There is no filesystem access anywhere in the i18n subsystem.
+
+### Using the locale in a handler
+
+`Locale` is a request extractor. It reads what `LocaleLayer` placed in the request extensions — it does not negotiate.
+
+```rust
+use arcature::i18n::{Locale, TranslationArgs};
+use arcature::prelude::*;
+
+async fn greet(locale: Locale) -> Result<Response> {
+    let args = TranslationArgs::new().with("name", "Ada");
+    let message = locale.translate("greeting", &args)?;
+    Ok(text(StatusCode::OK, message))
+}
+```
+
+| Method | Returns |
+|---|---|
+| `locale.id()` | `&LocaleId` — the active BCP-47 tag |
+| `locale.source()` | `LocaleSource` — which override selected this locale |
+| `locale.is_default()` | `bool` — true when the locale was fallen back to |
+| `locale.message(key)` | `Result<String, I18nError>` |
+| `locale.translate(key, &args)` | `Result<String, I18nError>` |
+| `locale.catalogs()` | `&Catalogs` — every registered locale |
+
+### From a view template
+
+Give the template struct a `Locale` field and call it. There is no `{{ t("key") }}` filter — adding one would mean a lookup the compiler cannot check, the opposite of why this module compiles its templates.
+
+```rust
+use arcature::i18n::Locale;
+use arcature::view::Template;
+
+#[derive(Template)]
+#[template(
+    source = "<h1>{{ locale.message(\"greeting\").unwrap_or_default() }}</h1>",
+    ext = "html",
+    askama = arcature::askama
+)]
+struct Greeting {
+    locale: Locale,
+}
+```
+
+Call `.in_locale(&locale)` on the `View` to set the `Content-Language` response header. The framework does not infer it.
+
+```rust
+let response = view(Greeting { locale: locale.clone() })
+    .in_locale(&locale)
+    .into_response();
+```
+
+### From Inertia props
+
+When `LocaleLayer` is installed and the `inertia` feature is on, the renderer automatically publishes the negotiated locale as a `locale` prop:
+
+```json
+{
+  "id": "fr",
+  "source": "header",
+  "available": ["en", "fr"]
+}
+```
+
+`available` is every registered locale in canonical-tag order — the list a language switcher needs. It is an object rather than a bare string so it can grow without breaking a client that already destructures it.
+
+<Warning>
+The `locale` prop is injected after prop resolution and is not a field of any `#[page]` struct, so `arc typegen` will not include it in generated TypeScript. Declare it by hand in your TypeScript page types, or add an explicit `locale` prop field to your page struct — which then wins over the automatic injection.
+</Warning>
+
+<Note>
+Enable `observe` alongside `i18n`. `I18nError` sends its diagnostics to `tracing::error!`, and `tracing` arrives with the `observe` feature. Without it, every translation failure produces a generic `500` and the operator gets no detail at all.
+</Note>

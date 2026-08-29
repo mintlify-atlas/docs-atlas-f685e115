@@ -1,0 +1,304 @@
+---
+title: "API Errors, Resources, and OpenAPI Documents"
+sidebarTitle: "API & OpenAPI"
+description: "RFC 9457 problem details for every error shape, the ErrorMapping pipeline stage, the #[resource] macro, and OpenAPI 3.1 generation from your route graph."
+---
+
+Arcature's API layer organises around two subjects that share one rule: both are generated from what the code already declares, never written a second time by hand. Problem documents describe every error shape your API can emit; the OpenAPI document is derived from the same route descriptors that generate your TypeScript types. Neither requires annotations on handlers.
+
+## Feature flags
+
+`arcature::api` compiles unconditionally — `Problem`, `ProblemBuilder`, `ProblemKind`, and `PROBLEM_JSON` are always available. The reason is the validation subsystem: it answers a failed `#[validate]` with a `Problem`, and a feature gate under `Problem` would create a circular dependency.
+
+| Feature | In `default` | What it adds |
+|---|---|---|
+| none | — | `Problem`, `ProblemBuilder`, `ProblemKind`, `PROBLEM_JSON` |
+| `api` | yes | `Problem` and `ProblemKind` in the prelude, `http::json()`, `Bound<T>` (with `dx` + `database`), `TestResponse::assert_problem` (with `test-kit`) |
+| `api-docs` | **no** | `api` + `uag`, enabling `arcature::uag::codegen::openapi` |
+
+<Warning>
+`api-docs` is in neither `default` nor `fullstack`. An API description is a map of the attack surface. Enable it explicitly for a build that is meant to produce one, and do not ship a production binary with it unless you want the document reachable from inside the process.
+</Warning>
+
+## Problem documents
+
+```rust
+use arcature::{Problem, ProblemKind};
+
+Problem::of(ProblemKind::NotFound)
+    .with_detail("user 42 does not exist")
+    .with_instance("/users/42")
+```
+
+```json
+{
+  "type": "urn:arcature:problem:not-found",
+  "title": "Resource not found",
+  "status": 404,
+  "detail": "user 42 does not exist",
+  "instance": "/users/42"
+}
+```
+
+The `IntoResponse` impl sets the status from the problem, `Content-Type: application/problem+json`, and `Content-Length`.
+
+| Member | Source | Omitted when |
+|---|---|---|
+| `type` | `kind.type_uri()`, or the URI given to `custom` | never |
+| `title` | `kind.title()`, or the status reason phrase for `custom` | never |
+| `status` | `kind.status()`, or the status given to `custom` | never |
+| `detail` | `.with_detail(..)` / `.detail(..)` | not set |
+| `instance` | `.with_instance(..)` / `.instance(..)` | not set |
+
+Three constructors:
+
+| Constructor | For |
+|---|---|
+| `Problem::of(kind)` | one of the distinguished categories |
+| `Problem::builder(kind)` | the same, chained, finished with `.build()` |
+| `Problem::custom(type_uri, status)` | a category outside the built-in list |
+
+`Problem::custom` derives `title` from the status reason phrase. Pass `"about:blank"` as the type when the status alone is the whole story.
+
+### Extensions
+
+Anything beyond the five standard members is an extension, serialised flat alongside them. `with_extension(key, value)` adds one; `with_extensions(&value)` adds every top-level pair from a JSON object.
+
+Four things are silently dropped:
+
+| Dropped | Why |
+|---|---|
+| a key equal to `type`, `title`, `status`, `detail`, or `instance` | an extension must never rewrite a standard member |
+| a value that serialises to JSON `null` | absent and null are indistinguishable |
+| a value whose serialisation fails | a response is not the place to discover it |
+| a `with_extensions` argument that is not a JSON object | there are no top-level pairs to extract |
+
+Extensions live in a `BTreeMap<String, Value>` — one entry per key, last write wins.
+
+## ProblemKind variants
+
+| Variant | Status | `title` | `type` |
+|---|---|---|---|
+| `BadRequest` | 400 | Bad request | `urn:arcature:problem:bad-request` |
+| `MalformedJson` | 400 | Malformed JSON request body | `urn:arcature:problem:malformed-json` |
+| `Authentication` | 401 | Authentication required | `urn:arcature:problem:authentication` |
+| `Authorization` | 403 | Access denied | `urn:arcature:problem:authorization` |
+| `NotFound` | 404 | Resource not found | `urn:arcature:problem:not-found` |
+| `MethodNotAllowed` | 405 | Method not allowed | `urn:arcature:problem:method-not-allowed` |
+| `Timeout` | 408 | Request timed out | `urn:arcature:problem:timeout` |
+| `Conflict` | 409 | Request conflicts with current state | `urn:arcature:problem:conflict` |
+| `PayloadTooLarge` | 413 | Request body too large | `urn:arcature:problem:payload-too-large` |
+| `UnsupportedMediaType` | 415 | Unsupported media type | `urn:arcature:problem:unsupported-media-type` |
+| `Validation` | 422 | Validation failed | `urn:arcature:problem:validation` |
+| `RateLimit` | 429 | Rate limit exceeded | `urn:arcature:problem:rate-limit` |
+| `Internal` | 500 | Internal server error | `urn:arcature:problem:internal` |
+| `Unavailable` | 503 | Service unavailable | `urn:arcature:problem:unavailable` |
+
+`ProblemKind::ALL` is the same fourteen as a `&'static [ProblemKind]`. The list is closed — application-specific categories use `Problem::custom`, not a new variant. The `type` values are URNs, not URLs: RFC 9457 permits a `type` that does not dereference, and a URI that must resolve commits to a page that must stay alive for as long as any client is running.
+
+`ProblemKind::for_status(status) -> Option<ProblemKind>` maps a bare status to a kind. `400` resolves to `BadRequest` (never `MalformedJson`); a status with no distinguished kind — `402`, `418`, `502`, `504` — returns `None`.
+
+## The ErrorMapping layer
+
+Most error responses in a Rust web stack come from layers, not handlers. Axum answers an unmatched path with a bare `404`; `tower-http` answers an oversized body with a bare `413`. "Bare" means: status line, no `Content-Type`, no body. A `fetch()` caller gets an empty string to parse.
+
+`ErrorMapping` is stage 11 of the pipeline. It is not installed by default — the slot is `None` until `.error_mapping(..)` is called:
+
+```rust
+use arcature::http::ErrorMapping;
+
+Application::<AppState>::new()
+    .catch_panic()
+    .error_mapping(ErrorMapping::new())
+```
+
+It sits inside the panic catcher and outside the body limit, timeout, session, CSRF, and router — so it sees the responses it exists to dress, and a mapped response is still compressed, still carries security headers, and is still logged under its real status.
+
+**Precedence, in order:**
+
+1. A custom mapper from `ErrorMapping::with(..)`, if it returns `Some`.
+2. Redaction, if the response is a `text/plain` 5xx and redaction is on.
+3. A problem body, if the response has no `Content-Type` at all.
+4. Otherwise the response is passed through untouched.
+
+A replacement keeps every header the original carried except `Content-Type` and `Content-Length`. This matters: a `405` carries `Allow`, a `429` carries `Retry-After`, a `401` carries `WWW-Authenticate`. Those are the parts a client acts on.
+
+`ErrorMapping::with(..)` receives the status and the *request* headers (never the response body). Reading the response body would mean buffering every error response. The request headers are what content negotiation wants — `Accept`, `X-Requested-With`, `X-Inertia` — so a mapper can return HTML to a browser and a problem document to everything else.
+
+### Redaction
+
+`ErrorMapping::new()` sets redaction to `!cfg!(debug_assertions)`:
+
+| Build | `redacts()` |
+|---|---|
+| `cargo build`, `cargo test` — debug assertions on | `false` |
+| `cargo build --release` — debug assertions off | `true` |
+
+`ErrorMapping::redact_errors(bool)` overrides in either direction. Keying on `debug_assertions` rather than an environment variable means a production binary's redaction posture is decided at compile time and cannot be changed by whoever can set environment variables on the host.
+
+What happens to a 4xx or 5xx:
+
+| Response leaving the stage | Result |
+|---|---|
+| no `Content-Type` | replaced with a problem document |
+| `405`, `408`, or `413` with `text/plain` | replaced (always, regardless of redaction) |
+| any other 5xx with `text/plain` | replaced when `redacts()` is true |
+| a 4xx with `text/plain` | untouched — it is a message the handler wrote for the client |
+| any status with `text/html`, `application/json`, `application/problem+json`, or anything else | untouched |
+
+Panics are separate. `.catch_panic()` (stage 10) answers with `Problem::of(ProblemKind::Internal)` and discards the payload entirely — no `detail`, in any profile.
+
+## Handler errors
+
+A controller returns `Result<Response>` whose error type is `arcature::Error`. Its `IntoResponse` impl does **not** build a `Problem` — it builds `application/json` with an underscored `type` URI.
+
+| Variant | Status | `code` |
+|---|---|---|
+| `NotFound` | 404 | `not_found` |
+| `BadRequest` | 400 | `bad_request` |
+| `Unauthorized` | 401 | `unauthorized` |
+| `Forbidden` | 403 | `forbidden` |
+| `Validation` | 422 | `validation_failed` |
+| `Redirect` | 400 | `invalid_redirect` |
+| `Io` | 500 | `io_error` |
+| `Database` | 500 | `database_error` |
+| `Cache` | 500 | `cache_error` |
+| `Storage` | 500 | `storage_error` |
+| `Mail` | 500 | `mail_error` |
+| `Job` | 500 | `job_error` |
+| `Serialization` | 500 | `serialization_error` |
+| `Config` | 500 | `config_error` |
+| `Other` | 500 | `internal_error` |
+
+<Note>
+`Error` is not `Problem`. The content type is `application/json`, not `application/problem+json`. The `type` URIs use underscores (`urn:arcature:problem:not_found`), while `ProblemKind` URIs use dashes (`urn:arcature:problem:not-found`). `TestResponse::assert_problem` fails on an `Error` response on both counts — which is the fastest way to notice which path a route is taking.
+
+`Error`'s redaction is keyed on the `APP_ENV` environment variable at response time: `production` or `prod` emits only `type`, `title`, and `status`; anything else (including an unset variable) adds `detail` from the error's `Display`.
+</Note>
+
+## Building an API resource
+
+```rust
+use arcature::resource;
+
+#[resource]
+pub struct LinkResource {
+    pub id: String,
+    pub url: String,
+    pub title: Option<String>,
+}
+```
+
+`#[resource]` takes no arguments, requires named fields, and emits three things:
+
+1. the struct unchanged, with `#[derive(Serialize)]` added
+2. `impl inertia::ClientData` with an `exposure_schema()` built from the named fields
+3. `impl ResourceMetadata`, the same fields as a `&'static [FieldShape]` for the route graph
+
+A SeaORM entity is not a resource. Convert explicitly with `impl From<Link> for LinkResource`. The reason: `Serialize` is not a safety boundary — a field whose type is not a recognised primitive would need to implement `ClientData`, preventing accidental exposure of internal models.
+
+Declaring the resource at the route:
+
+```rust
+routes! {
+    pub api {
+        state: AppState;
+        get  "/links"        => LinksController::index { name: links.index, query: Vec<LinkResource> }
+        get  "/links/{link}" => LinksController::show  { name: links.show,  query: LinkResource }
+        post "/links"        => LinksController::store { name: links.store, action: StoreLinkRequest }
+    }
+}
+```
+
+`action:` and `query:` on one route is a compile error — a route mutates or it reads, not both.
+
+## Model binding with `Bound<T>`
+
+`Bound<T>` loads a model from the database by a route parameter and answers with a typed problem when it cannot:
+
+```rust
+use arcature::{Bound, Json, Result};
+
+async fn show(link: Bound<Link>) -> Result<Json<LinkResource>> {
+    let link = link.into_inner();
+    // authorize here — binding did not
+    Ok(Json(LinkResource::from(link)))
+}
+```
+
+| Failure | Kind | Status |
+|---|---|---|
+| request has no path parameters | `BadRequest` | 400 |
+| no parameter named `T::KEY_PARAM` | `BadRequest` | 400 |
+| the value will not parse as `T::Key` | `BadRequest` | 400 |
+| `T::load` returned an error | `Internal` | 500 |
+| `T::load` returned `None` | `NotFound` | 404 |
+
+Binding is not authorization. `Bound<T>` proves the row exists; whether this caller may see it is a policy check the handler still owes. Requires `dx` + `database` + `api` together.
+
+## OpenAPI document generation
+
+With `api-docs`, the document is generated from the UAG — the same deterministic artifact behind `arc routes` and `arc typegen`. There is no `utoipa` annotation on the handler.
+
+```rust
+use arcature::uag::build;
+use arcature::uag::codegen::openapi::{self, OpenApiOptions};
+
+let artifact = build(&app::graph(), &app::page_contracts());
+let document = openapi::generate_json(&artifact, &OpenApiOptions {
+    title: "Acme API".to_owned(),
+    version: "2026.8".to_owned(),
+    description: None,
+})?;
+```
+
+`generate` returns a `serde_json::Value`; `generate_json` returns pretty-printed JSON. `OpenApiOptions::default()` is title `"Arcature application"`, version `"0.0.0"`, no description. No timestamp is included — a timestamp would make every regeneration a diff, defeating the purpose of a derived artifact.
+
+### Document structure
+
+| Key | Contents |
+|---|---|
+| `openapi` | `"3.1.0"` |
+| `info` | `title`, `version`, and `description` when set |
+| `paths` | one item per path, keyed by lowercase method |
+| `components.schemas` | one entry per named `action:` and `query:` type; absent when there are none |
+
+Per operation:
+
+| Key | Source | Absent when |
+|---|---|---|
+| `operationId` | the route's `name:` verbatim; otherwise lowercase method + path with non-alphanumerics replaced by `_` | never |
+| `tags` | the module name as a single tag | the route has no module name |
+| `parameters` | one `in: path` per path param, one `in: query` per `query_string:` field | there are none |
+| `requestBody` | `application/json`, `required: true`, the `action:` schema | there is no `action:` |
+
+### Type mapping
+
+| Rust | JSON Schema |
+|---|---|
+| `String`, `str`, `char` | `{"type": "string"}` |
+| any integer or float | `{"type": "number"}` |
+| `bool` | `{"type": "boolean"}` |
+| `Vec<T>` | `{"type": "array", "items": T}` |
+| `Option<T>` | `{"anyOf": [T, {"type": "null"}]}`, field omitted from `required` |
+| anything else | `{}` (empty schema — accepts anything) |
+
+Integer width is not carried: JSON has one number type and a `u64` does not survive JavaScript intact. References and lifetimes are stripped; `&'a std::string::String` and `String` map identically.
+
+### Validation constraint mapping
+
+| Rule | Becomes |
+|---|---|
+| `email` | `"format": "email"` |
+| `url` | `"format": "uri"` |
+| `length(min, max)` on a string | `minLength` / `maxLength` |
+| `length(min, max)` on a `Vec` | `minItems` / `maxItems` |
+| `length(equal = n)` | both bounds set to `n` |
+| `range(min, max)` | `minimum` / `maximum` |
+| `regex(...)` and `custom(...)` | nothing — a Rust const is not a pattern the document can carry |
+
+### What the document does not include
+
+The generator deliberately omits: security schemes and which routes require them; error responses (no `422` from validation, no `404` from `Bound<T>`, no `429` from the rate limiter); summaries, descriptions, or examples per operation; anything from Rust doc comments; and path parameters types (always `{"type": "string"}`). An omitted `responses` key is valid OpenAPI 3.1 and is the honest statement for a route that only redirects.
+
+`arc typegen` does not emit the OpenAPI document — it writes `routes.ts`, `pages.d.ts`, `forms.ts`, and `index.ts`. Producing the document means calling `openapi::generate_json` yourself, from a binary or a test you write. No route serves it by default.

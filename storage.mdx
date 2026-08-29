@@ -1,0 +1,336 @@
+---
+title: "Storage: File and Object Storage Over OpenDAL Disks"
+sidebarTitle: "Storage"
+description: "Named-disk object storage backed by OpenDAL, with path traversal prevention, streaming uploads, content-addressed keys, and magic-byte type verification."
+---
+
+Arcature's storage layer wraps [OpenDAL](https://opendal.apache.org/) behind a named-disk registry. A `Storage` handle holds one or more `Disk` instances, each backed by an OpenDAL `Operator` — which means the same API covers the local filesystem, S3-compatible services, and any other backend OpenDAL supports. `Storage` is a value, not a namespace; `storage.disk("s3")` is an instance method on a handle you obtained from state.
+
+## Configuring
+
+For a single backend, `Storage::connect` registers it as the `"default"` disk:
+
+```rust
+use arcature::storage::{Storage, StorageConfig};
+
+let storage = Storage::connect(StorageConfig::fs("storage/app")?).await?;
+```
+
+For multiple named disks, use `Storage::builder`:
+
+```rust
+use arcature::storage::{S3Config, Storage, StorageConfig};
+
+let storage = Storage::builder()
+    .disk("local", StorageConfig::fs("storage/app")?)
+    .disk("s3", StorageConfig::s3(
+        S3Config::new("acme-uploads")?
+            .region("eu-west-1")
+            .access_key_id(std::env::var("AWS_ACCESS_KEY_ID")?)
+            .secret_access_key(std::env::var("AWS_SECRET_ACCESS_KEY")?),
+    ))
+    .default_disk("local")
+    .connect()
+    .await?;
+```
+
+`Application::storage(config)` wires the single-backend path during the application lifecycle. `S3Config` redacts the access key ID and secret in its `Debug` impl, so credentials cannot leak through logs.
+
+The two storage features are separate to keep compile surface minimal:
+
+| Feature | What it enables |
+|---|---|
+| `storage-fs` | Local filesystem backend via OpenDAL |
+| `storage-s3` | S3-compatible object storage (AWS, MinIO, Cloudflare R2, …) |
+
+## Disks
+
+Resolve a registered disk by name from the `Storage` handle:
+
+| Call | Behaviour |
+|---|---|
+| `storage.disk("s3")` | The named disk — **panics** if it was never registered |
+| `storage.try_disk("s3")` | `Option<Disk>` — safe alternative for dynamic names |
+| `storage.default_disk()` | The disk named by `default_disk(...)`, or `"default"` if unset |
+| `storage.disk_names()` | Iterator over all registered disk names |
+
+<Warning>
+`storage.disk("name")` **panics** if the disk was never registered. A disk name is a deployment constant; a typo should stop the process at the first use rather than silently return an error every handler forgets to check. Use `storage.try_disk("name")` when the name is genuinely dynamic at runtime.
+</Warning>
+
+`Disk` is cheap to clone — the OpenDAL `Operator` inside it is `Arc`-backed.
+
+## Paths
+
+Every data-path method on `Disk` takes a `&StoragePath`, not a `&str`. The `StoragePath` constructor is where validation happens — a traversal attempt fails at the type boundary rather than at the backend.
+
+```rust
+use arcature::storage::StoragePath;
+
+let path = StoragePath::new("avatars/1.png")?;
+```
+
+**Rejected by `StoragePath::new`:**
+
+- Empty keys
+- Absolute paths (`/etc/passwd`)
+- Any `..` path segment
+- Backslashes
+- ASCII control characters
+- Empty segments (`a//b`)
+
+**Allowed:**
+
+- Trailing slashes (meaningful as list prefixes)
+- Unicode of all kinds
+- Dots inside a segment (e.g. `report.final.pdf`)
+
+## Operations
+
+All data-path methods live on `Disk`:
+
+```rust
+let disk = storage.disk("local");
+let path = StoragePath::new("reports/q4.pdf")?;
+
+// Write and read
+disk.put(&path, &bytes).await?;
+let bytes: bytes::Bytes = disk.get(&path).await?;
+
+// Metadata and listing
+let present: bool = disk.exists(&path).await?;
+let meta = disk.stat(&path).await?;
+let prefix = StoragePath::new("reports/")?;
+let entries = disk.list(&prefix).await?;
+
+// Copy, rename, delete
+disk.copy(&from, &to).await?;
+disk.rename(&from, &to).await?;
+disk.delete(&path).await?;
+```
+
+For large objects, use the streaming reader and writer rather than buffering the full object in memory:
+
+```rust
+// Stream a large object out
+let mut reader = disk.reader(&path).await?;
+
+// Stream a large object in
+let mut writer = disk.writer(&path).await?;
+```
+
+`Disk::from_operator(operator)` is the escape hatch when you need to configure the OpenDAL operator directly; `disk.operator()` borrows it back.
+
+## Public Files and `arc storage:link`
+
+The CLI command `arc storage:link` creates a symlink from `public/storage` to `storage/app/public`, following the convention that files written to the local disk under the `public/` prefix are served as static assets:
+
+```bash
+arc storage:link
+```
+
+Any file stored under `public/` on the local disk becomes accessible at `/storage/<path>` through the static file server, with no application code involved.
+
+## File Uploads (the `uploads` Feature)
+
+The upload pipeline is off by default and enabled with the `uploads` feature, which is also part of `fullstack`. It pulls in a multipart parser, the validation layer, SHA-2, magic-byte sniffing via `infer`, and Unicode normalization — none of which belong in a build with no upload route.
+
+```toml
+arcature = { version = "0.1", features = ["uploads"] }
+```
+
+### The `UploadedFile` Extractor
+
+`UploadedFile` is an Axum `FromRequest` extractor that handles the entire upload lifecycle before the handler body runs. By the time your handler starts, five guarantees hold:
+
+1. **Bounds** — total size, per-part size, part count, and a read timeout from `MultipartLimits`.
+2. **Whitelisted extension** — from the `UploadPolicy` on the route.
+3. **Sanitized filename** — path segments, control characters, bidi overrides, and Windows device names have all been processed or rejected.
+4. **Bytes that match the extension** — magic-byte sniffing verifies the file content against the declared extension.
+5. **Client-safe rejection** — any failure produces an RFC 9457 problem document.
+
+```rust
+use arcature::prelude::*;
+use arcature::storage::StorageError;
+use arcature::validation::upload::UploadedFile;
+
+const PREFIX: &str = "avatars";
+
+pub async fn store(
+    State(state): State<AppState>,
+    upload: UploadedFile,
+) -> Result<Response> {
+    let storage = state
+        .storage
+        .as_ref()
+        .ok_or_else(|| Error::Storage("no storage disk configured".to_string()))?;
+
+    let address = upload.store_under(&storage.default_disk(), PREFIX).await?;
+    let key = address.path_under(PREFIX).map_err(StorageError::from)?;
+
+    Ok((
+        StatusCode::CREATED,
+        json(serde_json::json!({
+            "path": key.as_str(),
+            "bytes": address.byte_len(),
+            "filename": upload.filename().to_string(),
+        })),
+    )
+        .into_response())
+}
+```
+
+`UploadedFile` consumes the body, so it must be the last handler argument.
+
+<Tip>
+`arc make:upload avatar` generates a controller with the full handler shape, the route, and the policy layer wired up. It is faster than writing it from scratch.
+</Tip>
+
+### `UploadedFile` Methods
+
+| Method | Returns |
+|---|---|
+| `filename()` | `&SafeFilename` — metadata only; never resolve it as a path |
+| `content_type()` | `Option<SniffedType>`, derived from the bytes, never from the `Content-Type` header |
+| `bytes()` | `&Bytes` |
+| `byte_len()` | `usize` |
+| `into_bytes()` | `Bytes`, consuming the wrapper |
+| `store(&disk)` | Write under `ab/cd/<sha256>.<ext>`, returns `ContentAddress` |
+| `store_under(&disk, prefix)` | Write under `<prefix>/ab/cd/<sha256>.<ext>`, returns `ContentAddress` |
+
+### Upload Policy and Allowed Extensions
+
+`UploadPolicy` is a `tower::Layer`. Apply it to a route to set the accepted extensions and (optionally) the expected form field name. Without a policy layer, the default is images only — the route fails closed, not open.
+
+```rust
+use arcature::storage::AllowedExtensions;
+use arcature::validation::upload::UploadPolicy;
+
+let router = axum::Router::new()
+    .route("/attachments", axum::routing::post(store))
+    .layer(UploadPolicy::new(AllowedExtensions::documents()).with_field("attachment"));
+```
+
+| Built-in set | Extensions |
+|---|---|
+| `AllowedExtensions::images()` | `jpg`, `jpeg`, `png`, `gif`, `webp` |
+| `AllowedExtensions::documents()` | `pdf`, `txt`, `csv` |
+| `AllowedExtensions::new(["JPG", "pdf"])?` | Whatever is listed, lowercased |
+| `AllowedExtensions::default()` | Empty — stores nothing, right behaviour for a misconfiguration |
+
+<Note>
+`svg` is deliberately absent from `images()`. An SVG is an XML document that may carry script; serving one inline is a stored-XSS primitive. Add it knowingly with `AllowedExtensions::images().with("svg")?` only if you understand the implications.
+</Note>
+
+The extension list is a whitelist, never a blacklist. A blacklist only covers the extensions someone thought of; the dangerous ones are often the others — `.phtml`, `.php7`, `.cgi`, `.htaccess`.
+
+### Content-Addressed Storage
+
+`store` and `store_under` write the object under a key derived from the SHA-256 of its bytes, split into two levels of fan-out:
+
+```text
+ab/cd/abcdef...9824.png
+```
+
+This means no byte of the uploaded request reaches the storage path. Path traversal is not one bug but a family of them — `../`, `%2e%2e%2f`, NUL-truncation, NTFS alternate data streams. Content addressing eliminates the entire family structurally: there is nothing left for a traversal payload to inhabit. Three more properties follow directly: the same bytes uploaded twice land on the same key, re-uploading is idempotent, and a filesystem disk gets 65,536 leaf directories rather than one directory with a million entries.
+
+```rust
+// ContentAddress carries the digest, extension, byte length, and path helpers.
+let address: ContentAddress = upload.store_under(&disk, "documents").await?;
+
+println!("digest: {}", address.digest());      // 64 hex chars
+println!("bytes:  {}", address.byte_len());
+println!("key:    {}", address.path_under("documents").unwrap().as_str());
+```
+
+`ContentAddress::of(bytes, extension)` computes an address for a buffer already in memory. `ContentHasher` (`new`, `update`, `byte_len`, `finish`) does it a chunk at a time without buffering the whole object.
+
+### Magic-Byte Sniffing
+
+The `content_type()` on `UploadedFile` comes from comparing the first 512 bytes against a table of magic numbers — not from the `Content-Type` header or the filename extension, both of which the client authored. A `shell.php` renamed `avatar.png` is refused here.
+
+The check is symmetric in both directions:
+
+- An extension with a known signature (`png`, `jpg`, `pdf`, `docx`, …) **must** sniff to that signature. Bytes that sniff to nothing are refused.
+- An extension with no signature (`txt`, `csv`, …) must sniff to nothing. If a `.txt` upload starts with a PE header or a zip local-file marker, it is refused just as firmly.
+
+There is no "unknown" state that slides through by default.
+
+### Filename Sanitization
+
+`SafeFilename::parse(filename, &allowed)` is the single place a client-authored `filename=` parameter is disarmed. After sanitization the result is **metadata** — it is safe to show in a UI or send in a `Content-Disposition` header, but it must never be used as a storage key directly unless you have considered the collision implications.
+
+| Input | Attack attempted | What happens |
+|---|---|---|
+| `../../etc/passwd.png` | Escape the storage root | Directory part discarded; name becomes `passwd.png` |
+| Name containing a NUL | Truncate name in a C API downstream | Rejected — control characters are never repaired |
+| `CON.png` | Open a Windows device | Rejected, with any extension and with trailing dots or spaces |
+| Name with a right-to-left override | Render extension as `.jpg` while extension is `.php` | Rejected — bidi format controls are fatal |
+| `shell.php.jpg` | Trigger a mis-configured `AddHandler` | Inner extension marker replaced: becomes `shell_php.jpg` |
+| Vietnamese filename with diacritics | Nothing — it is a legitimate name | Accepted, NFC-normalized, otherwise unchanged |
+
+### Multipart Limits
+
+`MultipartLimits` controls four bounds on the request body. All four have defaults, and there is no way to configure them as unlimited:
+
+| Setting | Default | What it stops |
+|---|---|---|
+| `fields` | 32 | Thousands of tiny parts in a small body |
+| `field_bytes` | 8 MiB | A single part consuming the full budget |
+| `total_bytes` | 16 MiB | A single request filling the heap or disk |
+| `read_timeout` | 30 s | A connection that stops sending mid-upload |
+
+Override them per route when the defaults do not fit:
+
+```rust
+use std::time::Duration;
+use arcature::http::multipart::MultipartLimits;
+
+let router = axum::Router::new()
+    .route("/avatar", axum::routing::post(store))
+    .layer(
+        MultipartLimits::new()
+            .with_total_bytes(2 * 1024 * 1024)
+            .with_field_bytes(2 * 1024 * 1024)
+            .with_fields(4)
+            .with_read_timeout(Duration::from_secs(10)),
+    );
+```
+
+<Warning>
+Axum wraps every request body in a 2 MiB `http_body_util::Limited` by default. Arcature never raises this limit — doing so is a deliberate choice the application must make. On a default build the effective ceiling on an upload is 2 MiB, not the 16 MiB `MultipartLimits` total. Raise `DefaultBodyLimit` explicitly on any route that accepts larger files.
+</Warning>
+
+### Streaming Large Uploads
+
+`UploadedFile` buffers the entire body in memory — it is the small-file convenience path. For anything larger than an avatar, drive `BoundedMultipart` in the handler and write each chunk through `UploadWriter`, which never holds more than one chunk at a time:
+
+```rust
+let mut upload = disk.begin_upload_under("videos").await?;
+
+let mut multipart = BoundedMultipart::new(multipart, limits);
+while let Some(mut field) = multipart.next_field().await? {
+    while let Some(chunk) = field.chunk().await? {
+        upload.write(chunk).await?;
+    }
+}
+
+// finish_verified re-checks the leading bytes against the extension
+// and removes the staging object before returning on mismatch.
+let address = upload.finish_verified(Extension::parse("mp4")?).await?;
+```
+
+`begin_upload_under(prefix)` validates the prefix before a byte is written, so a bad prefix fails at setup rather than after the entire upload has been streamed to a key that has nowhere to go.
+
+<Note>
+Neither `finish` nor `abort` is optional. Dropping an `UploadWriter` without calling one leaves a staging object behind and, on S3-compatible backends, leaves a multipart upload unclosed. There is no `Drop` that can fix this because both operations are `async`.
+</Note>
+
+## What This Module Does Not Own
+
+The storage subsystem does not reimplement object-storage protocols, S3 request signing, AWS credential machinery, a multipart upload engine, TLS, or cryptography. OpenDAL owns the protocol layer; the certified rustls plus aws-lc-rs stack owns TLS. Both crates are re-exported for direct access:
+
+```rust
+use arcature::storage::opendal; // The OpenDAL crate
+use arcature::storage::bytes;   // The bytes crate
+```

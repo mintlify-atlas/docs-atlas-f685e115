@@ -1,0 +1,239 @@
+---
+title: "WebSocket and SSE Realtime Connections in Arcature"
+sidebarTitle: "Realtime"
+description: "Add WebSocket and Server-Sent Events to your Axum app using a bounded broadcast channel. Covers Broadcast, SseEndpoint, WebSocketEndpoint, connection limits, lag handling, and graceful drain."
+---
+
+Arcature's realtime layer provides thin, typed wrappers over Axum's native `axum::extract::ws` and `axum::response::sse`. The fan-out core is a bounded `tokio::sync::broadcast` channel — one message published once, cloned to every subscriber. There is no proprietary protocol, no `X-Arcature-*` headers, and no JavaScript client package: browsers connect with the standard `WebSocket` and `EventSource` APIs.
+
+Realtime is app-owned. The framework mounts no route, registers no service, and holds no global. You build a `Broadcast`, a `Registry`, and a `ShutdownConfig` once at startup, store them in your Axum state, and clone `WebSocketEndpoint` / `SseEndpoint` into handlers.
+
+<Warning>
+**Fan-out reaches one process only.** `Broadcast` wraps a `tokio::sync::broadcast` channel — a channel between tasks inside a single OS process. A message published on instance A reaches only the WebSocket and SSE subscribers connected to instance A. Nothing errors and nothing warns when subscribers on instance B miss it. With two instances and clients spread evenly, roughly half of every broadcast is invisible to any given client. There is no configuration switch for this. See [Living with the Per-Process Limit](#living-with-the-per-process-limit).
+</Warning>
+
+## Enabling the Feature
+
+`realtime` is included in Arcature's default features:
+
+```toml
+[dependencies]
+arcature = { version = "0.1" } # realtime is on by default
+```
+
+On a `default-features = false` build, name it explicitly:
+
+```toml
+arcature = { version = "0.1", default-features = false, features = ["realtime"] }
+```
+
+The three dependencies it pulls (`tokio`, `futures`, `bytes`) are already present on a default build, so on a default feature set `realtime` adds no new crates — only edges.
+
+## The Broadcast Channel
+
+`Broadcast` is the fan-out core. Capacity is a required argument; there is no default and no `Default` impl:
+
+```rust
+use arcature::realtime::{Broadcast, ChannelPayload};
+
+// Returns None for capacity == 0 (never panics).
+let broadcast = Broadcast::new(256).expect("capacity is non-zero");
+
+let payload = ChannelPayload::from_bytes(serde_json::to_vec(&update)?);
+let delivered: usize = broadcast.publish(payload)?;
+```
+
+`ChannelPayload` wraps bytes behind an `Arc<[u8]>`. The channel stores the value once and clones it per receiver — the `Arc` makes that clone a refcount bump rather than a copy. Serialize it yourself; there is no JSON helper and no envelope.
+
+### `publish` Return Values
+
+| Situation | `publish` returns |
+| --- | --- |
+| `n` subscribers | `Ok(n)` |
+| No subscribers | `Err(ChannelError::Closed)` |
+| All `Broadcast` handles dropped | `Err(ChannelError::Closed)` |
+| Buffer full | `Ok(n)` — tokio overwrites the oldest retained message |
+
+An empty channel and a dead channel return the same `Err(Closed)`. Treat it as "nobody was listening", not as "something broke".
+
+<Note>
+`Broadcast::capacity()` reports the number you passed. Tokio internally rounds the ring buffer **up** to the next power of two, so a `Broadcast::new(100)` channel starts dropping oldest messages at 128. Lag is measured against the rounded size.
+</Note>
+
+## Subscribing Clients
+
+`broadcast.subscribe()` returns a `Subscription` whose `recv()` yields the next payload:
+
+```rust
+let mut sub = broadcast.subscribe();
+let payload = sub.recv().await?; // ChannelError::Closed or ::Lagged on error
+```
+
+`Subscription` also exposes `pub rx`, the raw `broadcast::Receiver<ChannelPayload>`, for composing with `tokio::select!`.
+
+## Server-Sent Events
+
+Build an `SseEndpoint`, then call `.handle(headers, channel_id)` from a handler. Every admitted SSE request subscribes to the one `Broadcast` the endpoint was built with:
+
+```rust
+use arcature::realtime::{
+    OriginPolicy, Registry, SseEndpoint, SseLimits, ShutdownConfig, VerifiedOrigin,
+};
+
+let sse = SseEndpoint::new(
+    broadcast.clone(),
+    OriginPolicy::allow_exact(VerifiedOrigin::from_trusted("https://app.example.com")),
+    registry.clone(),
+    SseLimits::conservative(),
+    shutdown.clone(),
+);
+
+// In a handler:
+async fn sse_handler(
+    State(sse): State<SseEndpoint>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    sse.handle(headers, "").await
+}
+```
+
+Admission is: origin check, then the connection limit. There is no per-channel authorizer on the SSE path — SSE is a plain `GET`, so authorization belongs in a middleware layer above the handler.
+
+The first event on every stream is a `retry:` preamble telling `EventSource` how long to wait before reconnecting. After that, each published payload becomes one `data:` event. Keep-alive is a `:keep-alive` comment every `keep_alive_interval` to prevent proxies cutting a quiet stream.
+
+## WebSocket
+
+The WebSocket endpoint adds per-connection authorization via the `Authorizer` trait. `authorize` returns `Option<Broadcast>` — both authorization and channel selection happen in one call:
+
+```rust
+use arcature::realtime::{Authorizer, Broadcast, WebSocketEndpoint, WsLimits};
+
+#[derive(Clone)]
+struct DocumentAccess {
+    state: AppState,
+}
+
+impl Authorizer for DocumentAccess {
+    fn authorize(
+        &self,
+        headers: &HeaderMap,
+        channel_id: &str,
+    ) -> impl Future<Output = Option<Broadcast>> + Send {
+        let this = self.clone();
+        let channel_id = channel_id.to_owned();
+        async move { this.state.channel_if_permitted(&channel_id).await }
+    }
+}
+
+let ws = WebSocketEndpoint::new(
+    DocumentAccess { state: state.clone() },
+    origin_policy,
+    registry.clone(),
+    WsLimits::conservative(),
+    shutdown.clone(),
+);
+```
+
+Returning `Option<Broadcast>` rather than a `bool` is the key design choice: authorizing a connection and choosing its channel are the same operation, so there is no code path where a connection is admitted without something having explicitly handed back a `Broadcast`. A channel name never implicitly authorizes.
+
+`AllowAll` implements `Authorizer` by admitting everything to one fixed channel. Use it in tests.
+
+### WebSocket Loop Behaviour
+
+Once upgraded, the server:
+
+- Sends each published payload as a **binary** frame (not text)
+- Parses no client messages — `Close` ends the loop, `Pong` refreshes the liveness clock, every other frame is discarded
+- Pings every `heartbeat_interval` and closes when the last pong is older than `heartbeat_timeout`
+
+An SSE connection receives the same `publish` call as UTF-8 in a `data:` line. A payload that is valid UTF-8 arrives intact on both transports.
+
+## Connection Registry and Cap
+
+`Registry` is an `Arc`-backed counter shared between the WebSocket and SSE endpoints. The connection cap is passed to `Registry::acquire` at admission time and comes from `ShutdownConfig::max_connections()`:
+
+```rust
+use arcature::realtime::{Registry, ShutdownConfig};
+
+let shutdown = ShutdownConfig::new(1_000); // connection cap
+let registry = Registry::default();        // starts empty
+```
+
+`acquire` refuses when `current >= max` — at the cap, not past it. A cap of 100 admits exactly 100 connections. The returned `ConnectionGuard` decrements the count on drop; both SSE and WebSocket hold their guard for the entire connection lifetime.
+
+Refusal statuses from `admission_status`:
+
+| Refusal reason | HTTP status |
+| --- | --- |
+| Origin denied | `403 Forbidden` |
+| Authorizer returned `None` (WebSocket) | `403 Forbidden` |
+| At or above connection limit | `503 Service Unavailable` |
+
+## Defaults
+
+`SseLimits`, `WsLimits`, and `ShutdownConfig` have no `Default` impl — ask for `conservative()` or fill in the fields.
+
+| Setting | Default | Source |
+| --- | --- | --- |
+| Channel capacity | **none** — required arg; `None` for 0 | `Broadcast::new` |
+| Connection limit | **none** — required arg | `ShutdownConfig::new` |
+| Origin policy | `DenyAll` | `OriginPolicy` default |
+| SSE retry hint | 3000 ms | `SseLimits::conservative()` |
+| SSE keep-alive interval | 15 s | `SseLimits::conservative()` |
+| WS max message size | 65536 bytes (64 KiB) | `WsLimits::conservative()` |
+| WS max frame size | 65536 bytes (64 KiB) | `WsLimits::conservative()` |
+| WS heartbeat interval | 20 s | `WsLimits::conservative()` |
+| WS pong timeout | 40 s (strict `>`, checked on heartbeat ticks) | `WsLimits::conservative()` |
+
+## Lag Handling
+
+A subscriber that falls further behind than the (rounded-up) channel capacity has messages overwritten under it. Tokio reports this as `RecvError::Lagged(n)` and resumes the receiver at the oldest retained message — the connection is not closed.
+
+| Transport | On lag | Missed message count |
+| --- | --- | --- |
+| SSE | A `:lagged` comment (invisible to `EventSource`) | Not sent |
+| WebSocket | Nothing — the loop continues silently | Not sent |
+
+A lagging client silently has a hole in its stream. If messages matter, combine realtime with a durable source the client can reconcile against on reconnect — the pattern `notifications-broadcast` uses, where the live push is an optimisation over an inbox row that is still there.
+
+## Graceful Drain
+
+```rust
+use std::time::Duration;
+use arcature::realtime::{self, ShutdownConfig};
+
+let shutdown = ShutdownConfig::new(1_000);
+
+// On SIGTERM:
+realtime::drain(&registry, &shutdown, Duration::from_secs(10)).await?;
+```
+
+`realtime::drain` calls `shutdown.begin_drain()` (idempotent) and then `registry.drain(bound)`. WebSocket connections see a `select!` arm fire immediately and send a `Close` frame. SSE connections check the drain flag once per event — an SSE stream parked waiting for the next payload stays parked until a payload arrives or the last `Broadcast` handle drops.
+
+<Note>
+A new connection arriving during a drain is not refused. A WebSocket is upgraded and immediately closed; an SSE request receives its `retry:` preamble then end-of-stream, which with the default 3-second retry hint means `EventSource` reconnects immediately. Stop accepting realtime requests at the router or load balancer if the reconnect loop matters.
+</Note>
+
+## Living with the Per-Process Limit
+
+The fan-out is bounded to one process, and there is no configuration switch. Three honest approaches:
+
+<CardGroup cols={1}>
+  <Card title="Run one instance" icon="server">
+    If your traffic fits, run a single instance. No cross-process coordination needed, and the single instance can scale vertically. This is the right answer for most applications below a certain load threshold.
+  </Card>
+  <Card title="Pin realtime upgrades to one instance" icon="arrow-right-arrow-left">
+    Route WebSocket and SSE upgrade requests to a single dedicated instance via your load balancer's path-based routing. All other HTTP requests distribute normally. The single realtime instance can still be restarted independently; clients reconnect.
+  </Card>
+  <Card title="Write the bridge yourself" icon="wrench">
+    A Redis pub/sub bridge is the obvious general answer. Subscribe to Redis in every instance; on publish, write to Redis; every instance's Redis subscriber writes to its local `Broadcast`. Delivery semantics, ordering, and back-pressure are yours to decide — which is exactly why Arcature does not ship one. The `Broadcast` API is designed to compose with this pattern.
+  </Card>
+</CardGroup>
+
+## What Realtime Does Not Do
+
+- **No message history or replay.** A subscriber receives what is published after it subscribes. A lagging subscriber's missed messages are gone. For catch-up after reconnect, use your database.
+- **No presence, rooms, or channel registry.** There is no list of who is connected, no join/leave events, and no directory mapping names to channels.
+- **No client-to-server messages.** The WebSocket loop discards every inbound frame except `Close` and `Pong`. For clients that need to send data, use a regular HTTP route.
+- **No routes or automatic wiring.** The framework mounts nothing at `/ws` or `/events`. Every value in this chapter is one your application constructs and stores.
+- **No cross-process bridge.** As described above. No ordering guarantee across channels — ordering holds within one `Broadcast`, which is all a single ring buffer can promise.

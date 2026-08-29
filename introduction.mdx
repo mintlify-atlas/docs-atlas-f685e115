@@ -1,0 +1,124 @@
+---
+title: "Arcature: One-Crate Full-Stack Rust Framework"
+sidebarTitle: "Introduction"
+description: "Arcature bundles HTTP routing, Inertia.js v3, SeaORM, auth, jobs, events, mail, cache, storage, and the arc CLI into a single versioned crate."
+---
+
+Arcature is an opinionated full-stack web framework for Rust. One crate, one release unit, one version number: HTTP routing built on Axum 0.8, native Inertia.js v3 server integration, a database layer over SeaORM 2.0 and SQLx 0.9, authentication and sessions, validation, background jobs, in-process events, cache, storage, mail, realtime, observability, and the `arc` command-line tool all ship together and are tested together. The framework integrates Axum, Tower, Tokio, SeaORM, SQLx, OpenDAL, lettre, and tracing, and owns what sits between them: the application lifecycle, the request pipeline order, the conventions, and the vocabulary. Raw Axum, Tower, SeaORM, and SQLx escape hatches remain reachable for when the framework's opinions run out.
+
+<Warning>
+**Status: pre-release.** `0.1.3` is on crates.io and is not yanked. Development is currently paused. `main` breaks without notice, and `0.x` says so deliberately. See the [known issues](#known-issues-in-013) section below before you start.
+</Warning>
+
+## Two design decisions that shape everything
+
+Every unusual choice in Arcature traces back to one of two principles. Reading them first saves time later.
+
+**No hidden registry.** No `inventory`, no `linkme`, no `TypeId` map, no thread-locals. All framework metadata is `&'static` const data emitted by macros and named by code you wrote, so `cargo expand` and "go to definition" are enough to trace what is wired up. The reasoning is in [ADR 0005](https://github.com/ArcatureLabs/Arcature/blob/main/docs/decisions/0005-no-hidden-registry.md).
+
+**No npm package.** Arcature publishes no JavaScript. Applications use the official `@inertiajs/*` adapters, and everything the Rust side hands the browser travels as generated `.ts` files in the application's own tree rather than through a framework runtime behind a virtual module. The reasoning is in [ADR 0001](https://github.com/ArcatureLabs/Arcature/blob/main/docs/decisions/0001-no-npm-package.md).
+
+## Architecture
+
+Each subsystem is a feature flag that reduces compile surface. The default feature set compiles a full-stack application with no extra flags. `#![forbid(unsafe_code)]` applies to the whole crate.
+
+| Subsystem | Built on | Feature |
+|---|---|---|
+| HTTP routing | Axum 0.8, Tower 0.5, tower-http 0.6 | always on |
+| Async runtime, `#[arcature::main]` | Tokio 1.53 | `macros` |
+| The DSL and its runtime contracts | — | `dx` |
+| Native Inertia.js v3 (server half) | the protocol, implemented directly | `inertia` |
+| Database | SeaORM 2.0 + SQLx 0.9 over one pool | `database` + one `db-*` |
+| Auth, sessions, CSRF, policies | argon2, tower-sessions, secrecy | `auth` |
+| Validation | validator 0.21 | `validation` |
+| Cache | Redis/Valkey (redis 1.5) | `cache` |
+| Storage | OpenDAL 0.58 | `storage-fs`, `storage-s3` |
+| Mail | lettre 0.11 (rustls) | `mail` |
+| Jobs | Database-backed queue, one claim strategy per dialect | `jobs` |
+| Events | in-process dispatch | `events` |
+| Realtime | WebSocket + SSE over axum, fan-out within one process | `realtime` |
+| Problem Details (RFC 9457), OpenAPI | — | `api` |
+| Observability | tracing, request ids, JSON logs, Prometheus text, W3C trace context | `observe` |
+| Static pages and assets | tower-http `fs` | `pages` |
+| The `arc` CLI and templates | clap 4 | `cli`, `templates` |
+| Compiled HTML views | askama 0.16 (no runtime parser, so no SSTI) | `views` |
+
+## Feature flags
+
+Features reduce compile surface. They are not a self-assembly kit: the default set builds a working full-stack application. Turn features *off* to compile less; name additional opt-ins explicitly.
+
+<Accordion title="Opt-in features (off by default)">
+
+Each of these is off because it carries a cost that every build not using it should not pay — an extra parser on the request path, a table and migration, or a cipher that requires a rotation story.
+
+| Feature | What you get |
+|---|---|
+| `auth-flows` | Constant-time account lookup, login throttling, password confirmation |
+| `auth-reset` | One-time password-reset links, stored as a digest |
+| `auth-remember` | Rotating remember-me tokens with theft detection |
+| `api-tokens` | Hashed bearer tokens for CLI/CI clients with no cookie |
+| `crypt` | `Encrypter`: XChaCha20-Poly1305 over a versioned, self-describing token |
+| `signed-urls` | `UrlSigner`: links that carry their own origin proof and deadline |
+| `uploads` | Multipart bodies, filename sanitizing, content-addressed names, magic-byte sniffing |
+| `views` | Compiled HTML views via Askama — no expression evaluator in the request path |
+| `i18n` | Fluent catalogs, locale negotiation against a whitelist |
+| `session-store-db` | Sessions in your database, so a deploy is not a mass logout |
+| `notifications` | One event, one recipient, many channels |
+| `notifications-db` | The in-app inbox channel |
+| `notifications-broadcast` | The live-push channel, over WebSocket/SSE |
+| `notifications-queue` | Mail delivery handed to the job queue instead of the request |
+| `otel` | OTLP traces |
+| `storage-s3` | S3-compatible object storage |
+| `oauth` | OAuth 2 with PKCE |
+
+Five of these bring a table and a migration: `auth-reset`, `auth-remember`, `api-tokens`, `notifications-db`, `session-store-db`.
+
+</Accordion>
+
+<Note>
+`fullstack` is **not** "everything". It adds `uploads`, `views`, `storage-s3`, and the tooling features (`cli`, `templates`, `dev-proxy`, `uag`) to the defaults. It leaves every opt-in above off. Name what you need explicitly.
+</Note>
+
+Database drivers are split so a SQLite application does not compile the PostgreSQL protocol. `database` on its own brings the crates but no driver; exactly one of `db-postgres`, `db-sqlite`, or `db-mysql` belongs in a build. The `default` feature picks `db-postgres`.
+
+## The request pipeline
+
+Layer order is a contract, written down in `src/application/pipeline.rs` and asserted by the test suite. Regardless of the order you call `.inertia()`, `.csrf()`, or any other builder method, the pipeline is always assembled outermost-first in this order:
+
+```text
+ 1 DevProxy      7 CORS          13 Timeout       19 PageContracts
+ 2 Proxy         8 RequestId     14 Maintenance   20 RedirectMapper
+ 3 Health        9 AccessLog     15 RateLimit     21 user .layer()s
+ 4 UagEndpoint  10 CatchPanic    16 Session       22 Router
+ 5 Compression  11 ErrorMapping  17 CSRF          23 StaticFiles
+ 6 SecurityHdrs 12 BodyLimit     18 Inertia
+```
+
+Two slots carry a second layer: stage 8 also holds `TraceContext` (`.trace_context()`) and stage 9 also holds `Metrics` (`.metrics(registry)`). They sit there — rather than among the user layers at 21 — because stage 21 is inside the body limit, timeout, maintenance, and rate limiter. A counter or trace installed there never sees a `413`, `408`, `503`, or `429` response, which is exactly the traffic an incident is about.
+
+Stages 5 through 21 are off unless explicitly enabled, with one exception: stage 20 (`RedirectMapper`) is on unless refused, because `redirect().route(..)` silently doing nothing is a worse default than one extension lookup per response.
+
+The reasoning for each position is in the module documentation and in [ADR 0004](https://github.com/ArcatureLabs/Arcature/blob/main/docs/decisions/0004-layer-order-contract.md).
+
+## Versioning
+
+Arcature follows semantic versioning. Current version: `0.1.3`, readable as `arcature::FRAMEWORK_VERSION`.
+
+Being in `0.x` shifts SemVer one field left: the breaking bump is the minor (`0.1` → `0.2`), the compatible one is the patch. Cargo agrees, so `arcature = "0.1"` takes patches and stops at `0.2`.
+
+<Note>
+`crates.io` also serves `arcature 2026.0.0` through `2026.2.1`, published from an abandoned predecessor repository. Those versions are **yanked** and share nothing with the current codebase but the name.
+</Note>
+
+## Writing Arcature with an AI assistant
+
+[`SKILL.md`](https://raw.githubusercontent.com/ArcatureLabs/Arcature/main/SKILL.md) is a single file written to be pasted into a coding assistant before asking it for Arcature code. It covers the things a model gets wrong from API names alone: which eighteen of forty-one features are on by default, that `body_limit` and `timeout` are unset by default, that `arc queue work` dispatches nothing without a handler registered, and that redaction does not reach span attributes. An assistant that has read it stops generating code that compiles but is wrong.
+
+## Known issues in 0.1.3
+
+<Warning>
+Both faults are in the scaffold's first five minutes. The library, request pipeline, application graph, and generators are covered by the test suite and are not implicated.
+</Warning>
+
+- **React stack preamble bug.** `arc new` with the default React stack does not run under `arc dev`. The generated Vite config omits the `@vitejs/plugin-react` refresh preamble, so the browser reports "can't detect preamble". Vue and Svelte stacks are unaffected.
+- **Dev loop looping.** `arc dev` has been observed looping `superseded` / `building` without ever serving. The cause has not been identified, and the supervisor does not report which file triggered the rebuild.

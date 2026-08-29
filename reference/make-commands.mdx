@@ -1,0 +1,362 @@
+---
+title: "arc make — Generator Commands for Every Artifact Kind"
+sidebarTitle: "Make Commands"
+description: "All 22 arc make:<kind> commands — what files each writes, which directories it creates, and when a follow-up step is needed from you."
+---
+
+The `arc make:<kind> <name>` family generates scaffolded source files from a project's root directory. Every generator is deterministic: it derives file paths and type names from the `<name>` argument, refuses to overwrite an existing file, and declares the new module in the nearest `mod.rs` (or creates that file if the directory is new). There is no `--force` flag — a file that already exists holds work you did, and overwriting it cannot happen by accident.
+
+Names follow a consistent pattern: `user`, `User`, `admin/users`, and `admin/users/show` are all valid. Slash-separated segments create nested directories and the full `mod.rs` chain up to any level Arcature already knows about.
+
+<Note>
+  All generators must be run from the application root — the directory that contains `Cargo.toml`. The generator checks this before writing anything, and reports which directory it found rather than a generic error.
+</Note>
+
+## Quick Reference
+
+| Command | Writes | Location |
+|---|---|---|
+| `arc make:module` | `mod.rs`, `controller.rs`, `service.rs`, `routes.rs` | `app/modules/<name>/` |
+| `arc make:controller` | `<name>_controller.rs` | `app/controllers/` |
+| `arc make:model` | `<name>.rs` | `app/models/` |
+| `arc make:migration` | `m<timestamp>_<name>.rs` | `database/migrations/` |
+| `arc make:request` | `<name>_request.rs` | `app/requests/` |
+| `arc make:resource` | `<name>_resource.rs` | `app/resources/` |
+| `arc make:policy` | `<name>_policy.rs` | `app/policies/` |
+| `arc make:service` | `<name>_service.rs` | `app/services/` |
+| `arc make:job` | `<name>_job.rs` | `app/jobs/` |
+| `arc make:event` | `<name>_event.rs` | `app/events/` |
+| `arc make:listener` | `<name>_listener.rs` | `app/listeners/` |
+| `arc make:middleware` | `<name>_middleware.rs` | `app/middleware/` |
+| `arc make:command` | `<name>_command.rs` | `app/commands/` |
+| `arc make:page` | `<name>_page.rs` | `app/pages/` |
+| `arc make:test` | `<name>.rs` | `tests/` |
+| `arc make:factory` | `<name>_factory.rs` | `database/factories/` |
+| `arc make:seeder` | `<name>_seeder.rs` | `database/seeders/` |
+| `arc make:notification` | `<name>_notification.rs` | `app/notifications/` |
+| `arc make:mail` | `<name>_mail.rs` | `app/mail/` |
+| `arc make:view` | `<name>_view.rs` + `<name>.html` | `app/views/` + `templates/` |
+| `arc make:upload` | `<name>_controller.rs` | `app/controllers/` |
+| `arc make:auth` | 6 files | `app/auth/` + `database/migrations/` |
+
+## Detailed Reference
+
+<Accordion title="arc make:module — Feature module with controller, service, and routes">
+
+Writes four files into a new directory under `app/modules/` and registers the whole module in `app/modules/mod.rs` without any follow-up step. This is the only generator that checks every target file before writing the first one — a partial write from a collision is worse than a clean refusal.
+
+```bash
+arc make:module billing
+arc make:module admin/billing
+```
+
+Files written:
+
+```
+app/modules/billing/mod.rs       # module! DSL declaration
+app/modules/billing/controller.rs
+app/modules/billing/service.rs
+app/modules/billing/routes.rs    # routes! block with prefixed names
+```
+
+The generated `routes.rs` prefixes route names with the module path (e.g. `admin.billing.index`) so two modules cannot collide through `Routes::merge`. The `app/modules/mod.rs` file gains a `pub mod billing;` declaration, a descriptor entry, and a routes entry — all inserted into the `// arc:modules` marker regions. If those markers are absent (the file was hand-edited), the entries are printed as notes for you to add manually.
+
+</Accordion>
+
+<Accordion title="arc make:controller — Axum handler struct">
+
+Generates a controller struct under `app/controllers/` and declares it in the nearest `mod.rs`.
+
+```bash
+arc make:controller links
+arc make:controller admin/users
+```
+
+The generated file contains a `pub struct LinksController;` with a commented `#[arcature::controller]` impl block and one placeholder `index` method. Methods must be `pub`, `async`, take no `self`, and declare a return type — the `#[arcature::controller]` macro rejects anything else with `error[ARC-M004]`.
+
+</Accordion>
+
+<Accordion title="arc make:model — SeaORM entity">
+
+Generates a SeaORM model under `app/models/`.
+
+```bash
+arc make:model link
+arc make:model admin/user
+```
+
+The scaffold includes the `#[sea_orm(table_name = "...")]` attribute, the standard `Model`, `ActiveModel`, `Entity`, `Column`, and `Relation` types, and a starter `QueryModel` impl for the `latest()` / `limit()` / `all()` chain used throughout the guide.
+
+</Accordion>
+
+<Accordion title="arc make:migration — Timestamped SeaORM migration">
+
+Generates a timestamped migration file under `database/migrations/`.
+
+```bash
+arc make:migration create_links_table
+```
+
+The file name is `m<YYYYMMDD>_<HHMMSS>_<name>.rs` — the timestamp is the second the command ran. The file contains a `Migration` struct implementing `MigrationTrait` with empty `up` and `down` methods.
+
+<Warning>
+  A migration that is not listed in `Migrator::migrations()` never runs. The generator prints a note reminding you to add it. Check `database/migrations/mod.rs` after running this command.
+</Warning>
+
+</Accordion>
+
+<Accordion title="arc make:request — Validated request payload">
+
+Generates a request struct under `app/requests/`.
+
+```bash
+arc make:request store_link
+arc make:request admin/update_user
+```
+
+The generated struct derives `Debug`, `Clone`, `Deserialize`, `Serialize`, and carries `#[arcature::request]` (which adds `Validate` and the marker trait). Placeholder `#[validate(...)]` attributes are included on each field. Use `Validated<StoreLinkRequest>` as the extractor in a handler to trigger validation and return a `422` with an RFC 9457 body on failure.
+
+</Accordion>
+
+<Accordion title="arc make:resource — Browser-safe response resource">
+
+Generates a resource struct under `app/resources/`. Resources are the Client Exposure Firewall — only types marked as `ClientData` (via `#[resource]` or `#[page]`) can reach the browser.
+
+```bash
+arc make:resource link
+arc make:resource admin/user
+```
+
+The generated file contains a `pub struct LinkResource` with `#[arcature::resource]` and placeholder fields. Nesting a non-`ClientData` type inside a resource fails to compile, which is the firewall's enforcement mechanism.
+
+</Accordion>
+
+<Accordion title="arc make:policy — Authorization policy">
+
+Generates an authorization policy under `app/policies/`.
+
+```bash
+arc make:policy link
+arc make:policy admin/user
+```
+
+The generated file contains a `pub struct LinkPolicy` implementing the `Policy` trait with placeholder `view`, `create`, `update`, and `delete` methods. Authorization is called explicitly: `auth.authorize::<Link, LinkPolicy>("update", &link)?`.
+
+</Accordion>
+
+<Accordion title="arc make:service — Application service">
+
+Generates a service struct under `app/services/`.
+
+```bash
+arc make:service billing
+arc make:service admin/reporting
+```
+
+The file contains a `pub struct BillingService;` with an impl block. Services declared in a `module!` block are resolved through `Resolve<S>` at compile time — there is no service locator.
+
+</Accordion>
+
+<Accordion title="arc make:job — Background job">
+
+Generates a job struct under `app/jobs/`.
+
+```bash
+arc make:job send_welcome_email
+arc make:job notifications/send_digest
+```
+
+The generated struct derives `Debug`, `Clone`, `Serialize`, `Deserialize`, and `Job`, with a `#[job(attempts = 3)]` attribute. Enqueue with `jobs.enqueue(&JobRequest::new(&SendWelcomeEmailJob::JOB, &payload)?)` and register the handler in a `Registry`.
+
+</Accordion>
+
+<Accordion title="arc make:event — In-process event">
+
+Generates an event struct under `app/events/`.
+
+```bash
+arc make:event user_registered
+arc make:event order/completed
+```
+
+The generated struct derives `Debug`, `Clone`, `Serialize`, `Deserialize`, and `Event`. Events are dispatched in-process through the `Dispatcher` and cross the listener boundary as `serde_json::Value`, which is what keeps the no-hidden-registry rule intact.
+
+</Accordion>
+
+<Accordion title="arc make:listener — Event listener">
+
+Generates a listener under `app/listeners/`.
+
+```bash
+arc make:listener send_welcome_on_registration
+```
+
+The file contains an `async fn` closure scaffold matching the event type. Listeners are registered through `Dispatcher::register`.
+
+</Accordion>
+
+<Accordion title="arc make:middleware — Tower middleware function">
+
+Generates a middleware function under `app/middleware/`.
+
+```bash
+arc make:middleware require_json
+arc make:middleware admin/audit_log
+```
+
+The scaffold is a `pub async fn` that takes a `Request`, calls `next.run(request)`, and returns the `Response`. Add it to the pipeline with `.layer(middleware::from_fn(require_json))`.
+
+</Accordion>
+
+<Accordion title="arc make:command — Application command">
+
+Generates a command struct under `app/commands/`.
+
+```bash
+arc make:command import_legacy_data
+```
+
+Application commands implement the `Command` trait and are registered in the module descriptor for dispatch.
+
+</Accordion>
+
+<Accordion title="arc make:page — Inertia page props struct">
+
+Generates an Inertia page props struct under `app/pages/`.
+
+```bash
+arc make:page links/index
+arc make:page dashboard
+```
+
+The generated file contains a `pub struct LinksIndexPage` with `#[arcature::page]`, which marks it as `ClientData` and makes it available to the `inertia!` macro. The type name corresponds to the component path the frontend renders.
+
+</Accordion>
+
+<Accordion title="arc make:test — Integration test">
+
+Generates an integration test file under `tests/`. Unlike every other generator, tests are not declared in a `mod.rs` — they are top-level Cargo integration tests that `rustc` discovers automatically.
+
+```bash
+arc make:test checkout
+arc make:test auth/login
+```
+
+The generated file contains `use arcature::prelude::*;` and a placeholder `#[tokio::test]` function using the `TestApp` harness.
+
+</Accordion>
+
+<Accordion title="arc make:factory — Model factory">
+
+Generates a model factory under `database/factories/`.
+
+```bash
+arc make:factory link
+arc make:factory user
+```
+
+The factory provides a `build()` method that returns a ready-to-insert `ActiveModel` with placeholder values. Used in tests and seeders to create consistent test data.
+
+</Accordion>
+
+<Accordion title="arc make:seeder — Database seeder">
+
+Generates a seeder under `database/seeders/`.
+
+```bash
+arc make:seeder users
+arc make:seeder demo_data
+```
+
+Seeders implement a `run` async method and are invoked by `arc db:seed`. They share the application's database connection.
+
+</Accordion>
+
+<Accordion title="arc make:notification — Multi-channel notification">
+
+Generates a notification struct under `app/notifications/`.
+
+```bash
+arc make:notification password_reset
+arc make:notification order/shipped
+```
+
+Requires the `notifications` feature. The generated struct implements `Notification` with placeholder channel methods (`mail`, `database`, `broadcast`). Enable channels by uncommenting the ones you need.
+
+</Accordion>
+
+<Accordion title="arc make:mail — Mailable">
+
+Generates a mailable under `app/mail/`.
+
+```bash
+arc make:mail welcome
+arc make:mail password_reset
+```
+
+The generated struct implements `Mailable` with a `build` method that takes an `Email` builder and returns a `Message`. Send it with `mail.to("user@example.com").send(&WelcomeMail).await?`.
+
+</Accordion>
+
+<Accordion title="arc make:view — Compiled Askama view (two files)">
+
+Writes two files: a Rust struct under `app/views/` and an HTML template under `templates/`. Both must agree on one string — the template path — or the crate does not compile. The generator guarantees they agree.
+
+```bash
+arc make:view admin/receipt
+arc make:view invoice
+```
+
+Files written:
+
+```
+app/views/admin/receipt_view.rs   # struct with #[template(path = "admin/receipt.html")]
+templates/admin/receipt.html      # the Askama template
+```
+
+Only the Rust file gets a `mod.rs` declaration. A `mod.rs` in `templates/` would be a Rust file in a directory the compiler never reads.
+
+Requires the `views` feature.
+
+</Accordion>
+
+<Accordion title="arc make:upload — Multipart upload controller">
+
+Generates a controller specialised for file uploads under `app/controllers/`.
+
+```bash
+arc make:upload avatar
+arc make:upload admin/document
+```
+
+The scaffold includes an `Upload` extractor, content-type validation, and storage disk write. The client-supplied filename, content type, and byte count are all validated before the first byte is written to disk. Requires the `uploads` feature.
+
+</Accordion>
+
+<Accordion title="arc make:auth — Complete sign-in flow (6 files)">
+
+The most expansive generator. Writes a full sign-in flow — account model, three controllers, a routes block, and a migration — all in one command.
+
+```bash
+arc make:auth user
+arc make:auth admin
+```
+
+Files written (example: `arc make:auth user`):
+
+```
+app/auth/user_account.rs        # account model implementing UserLoader
+app/auth/login_controller.rs    # login / logout handlers
+app/auth/register_controller.rs # registration handler
+app/auth/profile_controller.rs  # password change handler
+app/auth/routes.rs              # route table
+database/migrations/m<ts>_create_users_table.rs
+```
+
+The migration creates the `users` table with `id`, `email`, `password_hash`, and timestamps. The `login_controller` uses `AuthManager` with session-fixation defence built in (session ID rotated on login). The `register_controller` hashes the password through Argon2.
+
+<Tip>
+  Enable `auth-flows` in your `Cargo.toml` to get constant-time account lookup and login throttling alongside this scaffold. Without it, the controllers compile and work, but the lookup path is not constant-time.
+</Tip>
+
+</Accordion>

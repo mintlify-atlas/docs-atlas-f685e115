@@ -1,0 +1,220 @@
+---
+title: "Inertia.js Integration in Arcature — Server-Side Protocol"
+sidebarTitle: "Inertia"
+description: "Configure native Inertia v3, render page props behind the Client Exposure Firewall, choose eager or deferred strategies, and generate TypeScript contracts."
+---
+
+Arcature implements the server side of the Inertia v3 protocol natively. A stock `@inertiajs/react` or `@inertiajs/vue3` client talks to it without knowing Arcature exists — there is no `@arcature/client` package. Everything the Rust side hands the browser travels as generated `.ts` files in the application's own tree under `resources/js/generated/`, produced by `arc typegen`.
+
+## The mental model
+
+The browser's Inertia client makes ordinary HTTP requests. On a first visit, Arcature renders the initial HTML document with the page object embedded in a `<script data-page>` tag. On subsequent navigations — requests carrying `X-Inertia` — it returns the page object as JSON. Same route, same handler, two representations. The handler knows nothing about which one it is producing.
+
+## Configuration
+
+`InertiaConfig::new` takes an asset version string and a root-document renderer. Wire it into the application builder with `.inertia(config)`.
+
+```rust
+use arcature::assets::{Assets, AssetsConfig};
+use arcature::inertia::{InertiaConfig, vite_root_document};
+
+let assets = Assets::detect(&AssetsConfig::new())?;
+let config = InertiaConfig::new(
+    env!("CARGO_PKG_VERSION"),
+    vite_root_document("Acme", &assets, "resources/js/app.tsx"),
+)?;
+
+Application::new()
+    .routes(routes())
+    .inertia(config)
+    .build()
+```
+
+`vite_root_document` is the built-in renderer for Vite applications. `default_root_document(title)` is the minimal alternative for non-Vite setups. Both stamp the CSP nonce onto every `<script>` and `<link>` tag they emit.
+
+### Writing a custom root document
+
+A root document is any `Fn(ScriptBody) -> String`. `ScriptBody` displays as the `<script data-page>` payload plus the mount `<div>`. Use `body.nonce_attribute()` — which includes its leading space, or is empty when there is no nonce — to stamp CSP nonces on custom tags.
+
+```rust
+use arcature::inertia::{InertiaConfig, ScriptBody};
+
+let config = InertiaConfig::new(env!("CARGO_PKG_VERSION"), |body: ScriptBody| {
+    let nonce = body.nonce_attribute();
+    format!(
+        "<!doctype html><html><body>{body}\
+         <script{nonce} type=\"module\" src=\"/js/app.js\"></script>\
+         </body></html>"
+    )
+})?;
+```
+
+### Shared props
+
+`with_shared(shared_props)` registers props every page receives. Pass a closure that returns a serializable value.
+
+<Warning>
+Calling `.inertia(config)` is what installs `InertiaLayer`. A handler that takes `inertia: Inertia` in an application that never called `.inertia(..)` returns `500 inertia adapter error`. The failure looks like a handler bug rather than a wiring one — the extractor cannot distinguish between the two.
+</Warning>
+
+## Rendering
+
+The untyped path takes any `Serialize`. Use it for quick endpoints or when you are not using the Client Exposure Firewall.
+
+```rust
+use arcature::prelude::*;
+
+pub async fn index(inertia: Inertia) -> Result<Response> {
+    let response = inertia
+        .render("users/index", serde_json::json!({ "users": [] }))
+        .await?;
+    Ok(response)
+}
+```
+
+The `inertia!` macro is sugar over `render`. It requires a binding literally named `inertia` in scope. Note that due to a known macro hygiene limitation, call `Inertia::render` directly until it is resolved — see the inline documentation on `inertia!`.
+
+`render_advanced` accepts a `Props` value for per-prop evaluation strategies. `render_with_options` adds page-level flags such as history state and flash data.
+
+The asset version — the first argument to `InertiaConfig::new` — is what the Inertia client compares across navigations. When it changes, the client performs a full page reload. A release tag or a manifest hash both work. A constant means the client never reloads on deploy.
+
+## The Client Exposure Firewall
+
+`Serialize` does not mean "safe to send to a browser". A domain model derives `Serialize` for logging, testing, API responses, and a dozen other reasons — any one of those derivations puts it one field reference away from the wire. Arcature makes browser exposure a separate, explicit opt-in through two macros.
+
+### `#[arcature::page]` and `#[arcature::resource]`
+
+`#[page("name")]` declares a prop struct for a page. `#[resource]` declares a value that nests inside page props.
+
+```rust
+// The database entity — not browser-safe, derives Serialize for other reasons:
+pub struct User {
+    pub id: i64,
+    pub email: String,
+    pub password_hash: String, // must never reach the browser
+    pub is_admin: bool,
+}
+
+// Explicit resource — only the fields you choose:
+#[arcature::resource]
+pub struct UserResource {
+    pub id: String,
+    pub name: String,
+    pub avatar: Option<AvatarResource>,
+}
+
+// Conversion is explicit — you decide what the browser sees:
+impl From<User> for UserResource {
+    fn from(user: User) -> Self {
+        UserResource {
+            id: user.id.to_string(),
+            name: user.name.clone(),
+            avatar: None,
+        }
+    }
+}
+
+// Page props struct — only UserResource can appear here, not User:
+#[arcature::page("users/show")]
+pub struct ShowUserPage {
+    pub user: UserResource,
+    pub can_edit: bool,
+}
+```
+
+Both macros emit `impl ClientData`, whose `exposure_schema()` is built from the named fields. A non-primitive field type maps to `PropsSchema::nested::<FieldType>`, which requires `FieldType: ClientData`. So nesting a `User` directly inside a page struct fails to compile — the firewall is a trait bound at build time, not a runtime check.
+
+### Rendering through the firewall
+
+`render_page` is `render` with a `ClientData` bound. The component name comes from the contract rather than a string literal.
+
+```rust
+pub async fn show(inertia: Inertia) -> Result<Response> {
+    let page = ShowUserPage {
+        user: UserResource {
+            id: "1".into(),
+            name: "Ada".into(),
+            avatar: None,
+        },
+        can_edit: true,
+    };
+    Ok(inertia.render_page(ShowUserPage::PAGE_CONTRACT, page).await?)
+}
+```
+
+A controller method may also return `Page<T>` directly, letting `#[controller]` read the page identity off the return type. `page!(ShowUserPage { .. })` constructs one with a compile-time `ClientData` assertion at the call site.
+
+## Prop behaviours
+
+`Props` carries a per-prop evaluation strategy, matching the Inertia v3 protocol's full set of prop types.
+
+| Constructor | Behaviour |
+|---|---|
+| `eager(value)` | Always serialized and always included |
+| `always(value)` | Always included, even in partial reloads |
+| `lazy(f)` | Resolved only when explicitly requested by the client |
+| `optional(f)` | Omitted unless the client asks for it by name |
+| `deferred(f)` | Sent in a follow-up request after the initial render |
+| `deferred_group(name, f)` | Deferred, batched together under a named group |
+
+Merge strategy modifiers apply on top of evaluation strategies:
+
+| Modifier | Effect |
+|---|---|
+| `merge(prop)` | Client-side shallow merge across navigations |
+| `prepend(prop)` | Prepend to the existing array rather than replacing it |
+| `deep_merge(prop)` | Recursive deep merge of object props |
+
+```rust
+use arcature::inertia::{Props, always, deferred, eager, optional};
+
+pub async fn index(inertia: Inertia) -> Result<Response> {
+    let props = Props::new()
+        .prop("user", always(current_user))
+        .prop("links", eager(links_list))
+        .prop("analytics", deferred(|| async { load_analytics().await }));
+
+    Ok(inertia.render_advanced("links/index", props).await?)
+}
+```
+
+## Redirects
+
+`inertia.redirect(location)` builds an Inertia-aware redirect that handles both regular and SPA navigations correctly.
+
+```rust
+use arcature::inertia::{external, fragment};
+
+// Standard redirect — follows normal Inertia protocol:
+inertia.redirect("/dashboard")
+
+// External redirect — emits 409 with X-Inertia-Location to leave the SPA:
+external("https://example.com/checkout")
+
+// Fragment navigation:
+fragment("/page#section")
+```
+
+<Note>
+Use `external(url)` — not a regular redirect — when you need the Inertia client to perform a full browser navigation to a URL outside the SPA. The protocol represents this as a 409 response with an `X-Inertia-Location` header.
+</Note>
+
+## TypeScript generation
+
+`arc typegen` reads the collected page contracts and writes TypeScript files to `resources/js/generated/`. The contracts are gathered by `.page_contracts(artifact)` on the application builder, which publishes them as a request extension (the UAG endpoint reads them).
+
+Because page component names come from `PAGE_CONTRACT` rather than string literals, a renamed page cannot silently drift from its route. `arc typegen` refuses to write anything if the graph has a diagnostic — a partial generation is worse than none.
+
+<Info>
+The `locale` prop injected by `LocaleLayer` is added after prop resolution and is not part of any `#[page]` struct. Generated TypeScript will not include a `locale` field on page types. Declare it in TypeScript by hand, or add your own `locale` prop field to the page struct.
+</Info>
+
+## Non-JavaScript pages
+
+Inertia is for the application. For pages that are just HTML — a marketing page, a confirmation screen, an email body — the `views` feature renders Askama templates instead. The two mix freely: an application can serve Inertia pages behind sign-in and compiled views in front of it.
+
+An Inertia page never goes through `View`, and a view is a plain `Response` that never carries a page object. The scaffold demonstrates the split in one controller: `GET /` returns `Page<HomePage>` and `GET /welcome` returns `Response` from `view(WelcomeView { .. })`.
+
+## Vite and the one-port rule
+
+In development, Vite runs in `middlewareMode` with no TCP port of its own. The Rust process forwards to it over an IPC endpoint. There is one port in development and one in production, and no `localhost:5173` fallback that could break in CI or behind a proxy. `arc dev` manages both processes and the proxy automatically.

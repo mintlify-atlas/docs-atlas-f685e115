@@ -1,0 +1,291 @@
+---
+title: "Encryption and Signed URLs with Arcature's Crypt Module"
+sidebarTitle: "Encryption"
+description: "XChaCha20-Poly1305 authenticated encryption and HMAC-SHA256 signed URLs, keyed from APP_KEY subkeys, with versioned URL-safe output and constant-time MAC."
+---
+
+Arcature's `crypt` module covers two distinct use cases: `Encrypter` turns bytes into an opaque, tamper-evident token that only this application can read back; `UrlSigner` mints a link that carries its own proof of origin and, optionally, its own deadline. Both hang off one secret — `APP_KEY` — and both produce versioned output so algorithm upgrades are additive rather than breaking.
+
+## Two Features, Not One
+
+They are separate features because they pull different dependencies:
+
+```toml
+arcature = { version = "0.1", features = ["crypt", "signed-urls"] }
+```
+
+| Feature | What you get | Additional dependencies |
+| --- | --- | --- |
+| `crypt` | `Encrypter`, `EncryptError`, `DecryptError` | `chacha20poly1305`, `secrecy`, `zeroize`, `hmac`, `sha2` |
+| `signed-urls` | `UrlSigner`, `Clock`, `SystemClock`, `SignedUrlError` | `secrecy`, `zeroize`, `hmac`, `sha2`, `subtle`, `percent-encoding` |
+
+`AppKey` and `AppKeyError` are exported when either feature is active. Neither `crypt` nor `signed-urls` is in `default` or `fullstack`. The `auth-flows` feature implies `signed-urls` because email-verification links are signed URLs with an address binding on top.
+
+## The Application Key
+
+`APP_KEY` is 64 bytes of OS-generated randomness, written into `.env` as 128 lowercase hexadecimal characters.
+
+```bash
+# Write APP_KEY to .env (or replace an existing one).
+arc key:generate
+
+# Print to stdout without touching any file — for a secret store pipeline.
+arc key:generate --show
+```
+
+| Behaviour | Detail |
+| --- | --- |
+| Source | 64 bytes from the OS RNG |
+| Encoding | 128 lowercase hex characters |
+| Default action | Rewrite the `APP_KEY=` line in `.env`, or append one |
+| Re-running | Replaces rather than appends — no duplicate keys |
+| `--show` | Prints and touches nothing |
+
+Reading the key at application startup:
+
+```rust
+use arcature::crypt::AppKey;
+
+let key = AppKey::from_hex(&arcature::config::env_required("APP_KEY")?)?;
+```
+
+`AppKey::from_bytes(&[u8])` is the other constructor and takes exactly 64 bytes. `from_hex` trims surrounding whitespace and accepts either case — a value that passed through a secret store and lost its capitalisation is still valid.
+
+| `AppKeyError` | Means |
+| --- | --- |
+| `Empty` | Nothing but whitespace |
+| `NotHexadecimal` | A character outside `0-9a-fA-F`, or an odd digit count |
+| `WrongLength` | Decoded, but not to 64 bytes |
+
+`Debug` prints `AppKey(<redacted 64-byte key>)`. Every error message ends with the same instruction: run `arc key:generate` to write a valid one into `.env`.
+
+### Subkey Derivation
+
+`APP_KEY` is never handed directly to a cipher or MAC. Each consumer gets its own 32-byte subkey:
+
+```text
+subkey(label) = HMAC-SHA256(APP_KEY, "arcature/kdf/v1" || len(label) || label)
+```
+
+| Label | Consumer |
+| --- | --- |
+| `encrypter` | `Encrypter` |
+| `url-signer` | `UrlSigner` |
+
+Sharing one key across two algorithms is how a weakness in one becomes a weakness in both. Recovering the signing key does not hand anyone the ability to decrypt, and vice versa.
+
+`AppKey::subkey` is `pub(crate)`. The label constants live in the module — a caller outside the crate cannot accidentally make two subsystems share a subkey.
+
+## `Encrypter`
+
+For values an application has to hand out and get back: a token in a link, an opaque cursor, a payload in a queue an operator can read.
+
+```rust
+use arcature::crypt::{AppKey, Encrypter};
+
+let key = AppKey::from_hex(&arcature::config::env_required("APP_KEY")?)?;
+let encrypter = Encrypter::new(&key);
+
+let token = encrypter.encrypt_string("order 4417")?;
+assert!(token.starts_with("v1."));
+assert_eq!(encrypter.decrypt_string(&token)?, "order 4417");
+```
+
+| Method | Signature |
+| --- | --- |
+| `Encrypter::new(&AppKey)` | Derives the `encrypter` subkey |
+| `encrypt(&[u8])` | `Result<String, EncryptError>` |
+| `encrypt_string(&str)` | `Result<String, EncryptError>` |
+| `decrypt(&str)` | `Result<Vec<u8>, DecryptError>` |
+| `decrypt_string(&str)` | `Result<String, DecryptError>` |
+
+`new` is cheap enough to call per request, but building it once at startup and storing it in application state is the normal pattern. `Debug` prints `Encrypter(XChaCha20-Poly1305, <redacted key>)`.
+
+### Why XChaCha20-Poly1305
+
+Every message gets a fresh **192-bit** nonce from the OS RNG. That width is the whole reason for the X variant: at 192 bits, a random draw per message is safe for any number of messages, so there is no counter for a caller to manage and no way for a caller to accidentally reuse one.
+
+AES-GCM uses a 96-bit nonce. Random nonces there have a birthday bound a busy application can actually reach, and a repeat under GCM does not merely leak plaintext — it leaks the authentication subkey, giving the attacker forgery as well.
+
+A nonce failure returns `EncryptError::Rng` rather than falling back: a nonce from anything other than the OS RNG is not a nonce.
+
+### The Token Format
+
+```text
+v1.<base64url( nonce || ciphertext || tag )>
+```
+
+| Part | Size |
+| --- | --- |
+| Version tag | Literal `v1.` |
+| Nonce | 24 bytes |
+| Tag (Poly1305) | 16 bytes |
+| Ciphertext | Same length as the plaintext |
+
+The body is unpadded base64url, safe in a URL path, a query value, a cookie, and a JSON string with no further escaping. Associated data is the fixed string `arcature/crypt/v1`, so a `v1` token cannot be relabelled as a `v2` one by editing four characters.
+
+Encryption is randomised. The same plaintext encrypted twice gives two different tokens, by design. An empty plaintext round-trips correctly.
+
+### It Fails Closed
+
+A token whose bytes have changed anywhere returns no plaintext at all:
+
+| `DecryptError` | Means |
+| --- | --- |
+| `UnknownVersion` | No version tag this build reads — not an Arcature token, or from a newer release |
+| `Malformed` | Not unpadded base64url, or shorter than nonce + tag (40 bytes) |
+| `Authentication` | Tag did not match — altered, or encrypted under a different key |
+| `NotUtf8` | Authenticated but not valid UTF-8 — only from `decrypt_string`, not caused by an attacker |
+
+| `EncryptError` | Means |
+| --- | --- |
+| `Rng` | OS RNG failed — nothing was encrypted |
+| `Oversized` | Plaintext exceeds cipher addressing — unreachable on a 64-bit target |
+
+<Warning>
+`Encrypter` is not a password store. Passwords go through `arcature::auth::PasswordHasher` — hashing is one-way and encryption is not. A stolen `APP_KEY` turns an encrypted password table into a plaintext one. Also, two encryptions of the same value produce different tokens, so `WHERE email = ?` would find nothing in an encrypted column.
+</Warning>
+
+## `UrlSigner`
+
+A signed URL is the answer to "let this one person fetch this one thing, without giving them an account and without leaving the door open". The link is self-contained: nothing is written at signing time and nothing is looked up at verification time.
+
+```rust
+use std::time::Duration;
+use arcature::config::AppConfig;
+use arcature::crypt::{AppKey, UrlSigner};
+
+let key = AppKey::from_hex(&arcature::config::env_required("APP_KEY")?)?;
+let config = AppConfig::new().url("https://example.com");
+let signer = UrlSigner::new(&key, &config);
+
+// A link that expires in one hour.
+let url = signer.sign_temporary("/invoices/9", &[("as", "pdf")], Duration::from_secs(3600))?;
+// https://example.com/invoices/9?as=pdf&expires=<unix seconds>&signature=v1.<base64url>
+
+signer.verify(&url)?;
+```
+
+| Method | Behaviour |
+| --- | --- |
+| `UrlSigner::new(&AppKey, &AppConfig)` | Derives the `url-signer` subkey, roots links at `config.base_url()` |
+| `.with_clock(Arc<dyn Clock>)` | Replaces the clock expiry is measured against |
+| `.sign(path, params)` | A link with **no deadline** |
+| `.sign_temporary(path, params, valid_for)` | A link that expires `valid_for` from now |
+| `.verify(url)` | `Result<(), SignedUrlError>` |
+
+`params` is `&[(&str, &str)]`. `Debug` prints the base URL and `<redacted>` for the key.
+
+### The Expiry Is Inside the Signature
+
+`sign_temporary` writes the deadline into the `expires` query parameter as a Unix timestamp, and the MAC covers it along with the path and every other parameter. Moving the expiry forward changes the signed material, so an edited link returns `Mismatch`. An expiry outside the signature would make the feature decorative.
+
+A URL is valid up to **and including** its expiry second, and invalid from the next one.
+
+### Testing Expiry with an Injected Clock
+
+`Clock` is a trait (`fn now_unix(&self) -> u64`) so tests can control time without sleeping:
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+use arcature::crypt::{Clock, SignedUrlError, UrlSigner};
+
+struct Frozen(u64);
+impl Clock for Frozen {
+    fn now_unix(&self) -> u64 { self.0 }
+}
+
+let at = |second| UrlSigner::new(&key, &config).with_clock(Arc::new(Frozen(second)));
+
+let url = at(100).sign_temporary("/download/42", &[], Duration::from_secs(30))?;
+assert_eq!(at(130).verify(&url), Ok(()));
+assert_eq!(at(131).verify(&url), Err(SignedUrlError::Expired));
+```
+
+### Constant-Time MAC Comparison
+
+`verify` compares the presented MAC with the expected one using `subtle::ConstantTimeEq`:
+
+```rust
+if !bool::from(signature.as_slice().ct_eq(&expected)) {
+    return Err(SignedUrlError::Mismatch);
+}
+```
+
+A `==` would return at the first differing byte — a timing oracle that lets an attacker recover a valid signature one byte at a time (roughly 8,000 guesses instead of 2^256). `ConstantTimeEq` reads every byte every time.
+
+The signature is checked **before** the expiry. A tampered URL reports tampering whatever its deadline claims. The parsed timestamp is only read after the MAC proves it is trustworthy.
+
+### What `verify` Accepts and Rejects
+
+`url` may be absolute (as `sign` returns it) or a bare path-and-query.
+
+| Input | Result |
+| --- | --- |
+| The absolute URL as minted | Verifies |
+| Stripped to `/path?query` | Verifies |
+| With `#anything` appended | Verifies — fragments are never sent to a server |
+| Query reordered | Verifies — parameters are canonicalised |
+| Any parameter edited | `Mismatch` |
+| `https://example.com.evil/...` | `ForeignOrigin` — checked before any MAC is computed |
+| Relative URL not starting with `/` | `ForeignOrigin` |
+| No `signature` parameter | `MissingSignature` |
+| Two `signature` parameters | `Malformed` |
+| Signature with no `v1.` tag | `UnknownSignatureVersion` |
+| Signature not in base64url | `Malformed` |
+| Unreadable percent-escape | `Malformed` |
+| Genuine, past deadline | `Expired` |
+| Genuine, no `expires` at all | Verifies at any time |
+
+Two parameter names are reserved and cannot be passed by a caller: `signature` and `expires`. A path containing `?` or `#` returns `QueryInPath` — pass the query as `params` so it is canonicalised and signed.
+
+<Tip>
+Log `Mismatch` and `Expired` separately. The first means someone edited a link; the second means someone used a link too late. Treating them alike hides the difference between an attack and a slow reader.
+</Tip>
+
+### What Is Signed and How It Is Canonicalised
+
+The MAC input is, in order: the domain separator `arcature/signed-url/v1`; the path (length-prefixed); the parameter count as a big-endian `u64`; then each parameter's name and value (length-prefixed), sorted by name then by value.
+
+Length prefixes are load-bearing: without them, `a=bc` and `ab=c` feed the MAC one identical string.
+
+Sorting lets a reordered query still verify. Parameters are compared after percent-decoding, so a link a mail client re-escaped still verifies; a link that was *edited* does not.
+
+On the way out, everything outside RFC 3986's unreserved set (`A-Za-z0-9-._~`) is percent-encoded. A space becomes `%20`, never `+`.
+
+## Key Management
+
+`APP_KEY` is one secret per deployment: one thing to rotate, one thing to store, one thing to keep out of a repository. There is no key identifier in either format and no multi-key fallback built into the module.
+
+<Warning>
+On the day `APP_KEY` changes, every outstanding encrypted token returns `DecryptError::Authentication`, every signed URL returns `SignedUrlError::Mismatch`, and every signed session cookie becomes invalid. If you need an overlap window during rotation, keep the old `AppKey` alongside the new one, try the new one first, fall back to the old, and stop falling back once the longest deadline you ever minted has passed. The module gives you the pieces (`AppKey::from_bytes`, separate `Encrypter` or `UrlSigner` per key) and none of the policy.
+</Warning>
+
+### Important Limits
+
+<Accordion title="Limits and known failure modes">
+
+**A signed link is replayable until it expires.** A signed URL is a bearer token in a query string. Presenting it twice works as well as presenting it once. It will appear in browser history, `Referer` headers, and access logs. Give a link the shortest lifetime the use allows. Do not sign an action a replay would make worse — a download link is reasonable; "close this account" is not.
+
+For single-use links: record something when the link is redeemed (a nonce marked used, a row's state moved, a version column bumped) and check that record after `verify` returns `Ok`. `verify` answers "did we issue this, and is it still in date" — not "has this already been used".
+
+**An encrypted token has no deadline and no context.** `Encrypter` is not `UrlSigner`. A token has no expiry field; a token minted today decrypts in a year under the same key. If a deadline matters, put a timestamp in the plaintext and check it after decrypting. If two purposes must not accept each other's tokens, put the purpose in the plaintext and check it after decrypting.
+
+**A pre-epoch clock fails open, not closed.** `SystemClock` maps a time before the Unix epoch to `0`. The expiry check is `now > expires_at`, so a clock reporting `0` is never past any deadline. A machine with a dead RTC battery or a deliberately wound-back clock will honour every expired link. Supply a `Clock` implementation that refuses rather than returning a sentinel if this matters to your deployment.
+
+**The path is signed as literal bytes.** A client that escapes a space, a proxy that resolves a `..` segment, or a router that normalises a trailing slash will produce `Mismatch`. Build signed paths from characters that survive a round trip, and put anything else in a parameter.
+
+</Accordion>
+
+## Versioning
+
+Every value this module produces carries a version tag:
+
+| Value | Version tag |
+| --- | --- |
+| Encrypted token | Leading `v1.` |
+| URL signature | `v1.` inside the `signature` parameter value |
+| Key derivation | Domain separator `arcature/kdf/v1` |
+
+Replacing an algorithm later is additive: the new reader keeps the old branch, tokens and links in flight keep working, and nothing needs to be re-issued during a deploy. A format with no version can only be changed by breaking every holder of an outstanding token at once.

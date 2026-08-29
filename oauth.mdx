@@ -1,0 +1,242 @@
+---
+title: "OAuth 2.0 Authorization Code with PKCE in Arcature"
+sidebarTitle: "OAuth"
+description: "Provider-agnostic OAuth 2 PKCE client: configure any provider with two URLs, redirect users, exchange authorization codes, and handle user info yourself."
+---
+
+The `oauth` feature is an OAuth 2.0 Authorization Code with PKCE client — not an authorization server. It ends at the token response. Calling a userinfo endpoint, matching the result to a local account, and starting a session are all your code. This two-URL model is intentional: the module does one thing rather than coupling provider-specific JSON shapes into the framework.
+
+## Enabling the Feature
+
+```toml
+arcature = { version = "0.1", features = ["oauth"] }
+```
+
+`oauth = ["dep:oauth2", "dep:url"]`. It is in neither `default` nor `fullstack`, and it requires nothing else — no database, no job runner. The `oauth2` crate and its vendored HTTP client are re-exported as `arcature::oauth::oauth2` so your code targets the version Arcature pinned rather than resolving its own.
+
+## Configuring a Provider
+
+An `Endpoints` is a pair of `&'static str`. The bundled providers are `const` values — not variants of an enum — so an in-house SSO is configured identically to GitHub:
+
+| Preset | Authorization endpoint | Token endpoint |
+| --- | --- | --- |
+| `GITHUB` | `https://github.com/login/oauth/authorize` | `https://github.com/login/oauth/access_token` |
+| `GOOGLE` | `https://accounts.google.com/o/oauth2/v2/auth` | `https://oauth2.googleapis.com/token` |
+| `DISCORD` | `https://discord.com/oauth2/authorize` | `https://discord.com/api/oauth2/token` |
+
+```rust
+use arcature::oauth::{Endpoints, OauthClient, GITHUB};
+
+// A bundled provider.
+let github = OauthClient::new(
+    GITHUB,
+    client_id,
+    Some(client_secret),
+    "https://app.example.com/auth/github/callback",
+)?;
+
+// A provider the framework has never heard of, configured identically.
+const ACME_SSO: Endpoints = Endpoints {
+    authorization: "https://sso.acme.example/oauth/authorize",
+    token:         "https://sso.acme.example/oauth/token",
+};
+let sso = OauthClient::new(ACME_SSO, client_id, Some(client_secret), redirect_uri)?;
+```
+
+For endpoints known only at runtime (read from config or discovered):
+
+```rust
+let client = OauthClient::for_urls(
+    &config.authorization_endpoint,
+    &config.token_endpoint,
+    &config.client_id,
+    config.client_secret.clone(), // Option<String>
+    &config.redirect_uri,
+)?;
+```
+
+`client_secret` is an `Option`. `None` is a public client — a native or single-page app relying on PKCE alone — and the secret is omitted from the token request rather than sent empty (some providers reject an empty secret outright). An `OauthClient` owns its HTTP client and its endpoints; hold it as application state.
+
+### Transport security
+
+All three URLs are parsed and transport-checked when the client is built:
+
+| URL | Verdict |
+| --- | --- |
+| `https://` anything | Allowed |
+| `http://localhost` (ASCII case-insensitive) | Allowed |
+| `http://127.0.0.1`, any IPv4 loopback | Allowed |
+| `http://[::1]`, any IPv6 loopback | Allowed |
+| `http://` any other host | Refused |
+| `http://localhost.evil.test` | Refused |
+| Any other scheme | Refused |
+
+There is no flag to widen this. Development gets what it needs from the loopback exception; `localhost.evil.test` is not loopback and is refused.
+
+The token-exchange HTTP client is built with `redirect::Policy::none()`. A token endpoint that answers `302` is a server-side request forgery primitive, not a provider quirk to accommodate.
+
+## The Authorization Redirect
+
+```rust
+use arcature::oauth::OauthClient;
+
+pub async fn start(session: Session, client: OauthClient) -> Result<Redirect> {
+    let start = client.authorize(&["read:user"])?;
+
+    // Store per-attempt values in the session — not per-user.
+    // A user with two tabs open has two independent sets.
+    session.put("oauth.state", start.state().as_str()).await?;
+    session.put("oauth.verifier", start.verifier().secret()).await?;
+
+    Ok(Redirect::to(start.url().as_str()))
+}
+```
+
+`authorize` returns an `Authorization` holding three things: the redirect URL, the PKCE verifier, and the state parameter. The browser receives only the URL. The verifier and state must survive until the callback — store them in the session.
+
+`Authorization`'s `Debug` prints the URL through the path and then `?[redacted]`, because the state and the code challenge live in that query string and `Debug` output ends up in logs.
+
+## PKCE (S256)
+
+The challenge is built by `PkceCodeChallenge::new_random_sha256()`. The method is always `S256` — there is no way to request `plain`.
+
+The rejected alternative, `plain`, sends the verifier as the challenge itself. An attacker who intercepts the authorization request reads the challenge and, under `plain`, already has the secret. `S256` commits to a SHA-256 of the verifier, so the intercepted challenge is useless without the verifier the client holds.
+
+What PKCE defends against: an authorization code intercepted through a malicious app registered on the same custom URI scheme, a code leaked via `Referer`, or browser history on a shared machine. The code alone is not enough to redeem — the token endpoint wants the verifier whose SHA-256 was committed to at the start.
+
+## The State Parameter
+
+| Property | Value |
+| --- | --- |
+| Source | `getrandom::fill`, the OS CSPRNG |
+| Length | 32 bytes |
+| Encoding | Lowercase hex (64 characters), safe in a query string unescaped |
+| On RNG failure | `OauthError::Entropy`, no fallback |
+| Comparison | `OauthState::verify` → `constant_time_eq` |
+
+The state comparison is constant-time. `constant_time_eq` XOR-accumulates every byte and tests the accumulator once at the end, going through `std::hint::black_box` to prevent the compiler from turning it into an early exit.
+
+<Warning>
+The state is checked **before** the code is redeemed. A state mismatch returns `OauthError::StateMismatch` without touching the network. This matters because an authorization code is one-time: a state check that ran after the exchange would let a CSRF callback burn a legitimate code.
+</Warning>
+
+## The Callback and Token Exchange
+
+```rust
+use arcature::oauth::{OauthClient, OauthState, PkceVerifier};
+
+pub async fn callback(
+    session: Session,
+    client: OauthClient,
+    Query(params): Query<CallbackParams>, // code: String, state: String
+) -> Result<Response> {
+    // Use `forget` — not `get` — so the values are consumed in one request.
+    let stored: String = session
+        .forget("oauth.state")
+        .await?
+        .ok_or_else(|| Error::forbidden("no OAuth flow in progress"))?;
+    let verifier: String = session
+        .forget("oauth.verifier")
+        .await?
+        .ok_or_else(|| Error::forbidden("no OAuth flow in progress"))?;
+
+    let tokens = client
+        .exchange(
+            &OauthState::from_stored(stored),
+            &params.state,
+            &params.code,
+            PkceVerifier::from_secret(verifier),
+        )
+        .await?;
+
+    // tokens.access_token() is a bearer credential.
+    // Send it; do not put it in a log line or an error message.
+    Ok(sign_in(profile_for(&tokens).await?).await?)
+}
+```
+
+`exchange` takes the stored state by reference and the verifier **by value** — the verifier is consumed so the same one cannot be reused for a second exchange by accident. `forget` removes both values from the session: a flow finishes once, and leaving them behind leaves a live verifier in the session for whatever request arrives next.
+
+### What a successful exchange returns
+
+| `TokenSet` accessor | Type | Notes |
+| --- | --- | --- |
+| `access_token()` | `&str` | The provider's `access_token` |
+| `refresh_token()` | `Option<&str>` | Present if the provider returned one |
+| `token_type()` | `&str` | Lowercased — `"bearer"` not `"Bearer"` |
+| `expires_in()` | `Option<Duration>` | From the `expires_in` field |
+| `scopes()` | `&[String]` | The *granted* scopes, not what was requested |
+
+The `scopes()` accessor exists because narrowing the granted scopes is the provider's prerogative. Always read it from the response rather than echoing back the request.
+
+## Fetching User Info
+
+The module does not do this — deliberately. An OAuth 2.0 authorization server is an authorization endpoint and a token endpoint. A userinfo endpoint belongs to a resource server, and its path, JSON shape, and field names differ per provider. A framework type covering them would be a per-provider parser, which is the provider enum this module already declined.
+
+The leg after `exchange` is an ordinary authenticated HTTP request:
+
+```rust
+use arcature::oauth::oauth2::reqwest;
+
+let profile: serde_json::Value = reqwest::Client::new()
+    .get("https://api.github.com/user")
+    .bearer_auth(tokens.access_token())
+    .send()
+    .await?
+    .json()
+    .await?;
+```
+
+`arcature::oauth::oauth2::reqwest` is the client `oauth2` already vendors, so reaching for it adds nothing to the dependency graph.
+
+## Errors
+
+`OauthError` is the one error type. Every variant is built from a fixed `&'static str` or a provider-supplied error code — never from a response body.
+
+| Variant | Carries | Raised by | Retryable? |
+| --- | --- | --- | --- |
+| `InvalidUrl { role }` | The role (`&'static str`) | Construction | No — config bug |
+| `InsecureTransport { role }` | The role | Construction | No — same |
+| `Entropy` | Nothing | `authorize` | No |
+| `StateMismatch` | Nothing | `exchange`, before the network | No — restart the flow |
+| `Transport` | Nothing | `exchange` | Yes |
+| `Provider { code }` | The provider's `error` member | `exchange` | Depends on the code |
+| `MalformedResponse` | Nothing | `exchange` | No |
+
+`Provider { code }` carries the RFC 6749 fixed vocabulary (`invalid_grant`, `invalid_client`, etc.) but not the `error_description` — that is free-form text the provider wrote.
+
+A token-endpoint response that does not parse becomes `MalformedResponse` with the body dropped. The cost of that is real: debugging a provider that responds in an unexpected shape means reproducing the request, because the error will not tell you what it said. The benefit is that a malformed *success* response still contains an access token, and a variant that carried the body for diagnostics would put credentials into every log line that formatted the error.
+
+## What Is Never Logged
+
+| Type | `Debug` renders |
+| --- | --- |
+| `PkceVerifier` | `PkceVerifier([redacted])` |
+| `OauthState` | `OauthState([redacted])` |
+| `TokenSet` | `TokenSet([redacted])` |
+| `Authorization` | URL through the path, then `?[redacted]`, plus two redacted fields |
+| `OauthClient` | `OauthClient { .. }` |
+| `Endpoints` | Full — it holds two public URLs |
+| `OauthError` | Derived, carries no body |
+
+None of the secret-bearing types implements `Display`, so none can reach a log line through ordinary formatting. Reading a secret out requires calling `secret()`, `as_str()`, or `access_token()` by name.
+
+## What This Module Does Not Do
+
+<Accordion title="Explicit non-features and their rationale">
+
+**No provider registry, no discovery.** Three `const Endpoints` presets exist and there is no `FromStr`, no enum, no table keyed by a config string, and no OpenID Connect `/.well-known/openid-configuration` fetch. Fetch the discovery document yourself and pass the two URLs to `for_urls`.
+
+**No token storage.** The `oauth` feature brings no table, no migration, and no model. `authorize` returns the state and verifier; `exchange` returns a `TokenSet`. Where those live and whether the access token is kept after the flow is your decision — and the reason `oauth` requires no `database`.
+
+**No refresh loop, no refresh method.** `exchange` is the only method that talks to a token endpoint. `TokenSet::refresh_token()` hands you the string; driving the refresh grant goes through the re-exported `oauth2` crate directly.
+
+**No OpenID Connect.** No `id_token` on `TokenSet`, no JWT parsing, no signature verification, no nonce.
+
+**No revocation, no introspection.** RFC 7009 and RFC 7662 are two more endpoints, and `Endpoints` holds two.
+
+**No routes, no extractor, no middleware.** Nothing in `src/oauth/` imports axum. There is no callback handler to mount and no `arc make:` generator. The two handlers in this page are what an application writes.
+
+**No timeout on the token exchange.** The HTTP client is built with one option set — the redirect policy — so the request inherits the vendored `reqwest` defaults. Wrap the `exchange` future in `tokio::time::timeout` if you need a bound.
+
+</Accordion>

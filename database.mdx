@@ -1,0 +1,301 @@
+---
+title: "Database: SeaORM + SQLx Over One Shared Pool"
+sidebarTitle: "Database"
+description: "Connect to PostgreSQL, SQLite, or MySQL with a single shared pool that both SeaORM and SQLx read from — no global registry, no thread-locals, no second pool."
+---
+
+Arcature's database layer gives SeaORM and SQLx a single shared connection pool. There is no second pool, no global registry, and no thread-local — `SqlxPostgresConnector::from_sqlx_postgres_pool` bridges the two libraries at startup, and both sides use the same connections from that point on. The `Db` handle is `Clone + Send + Sync + 'static`, so it fits naturally into Axum state alongside anything else your application holds.
+
+## Connecting
+
+Configure and connect once at startup. `DatabaseConfig` accepts a database URL, optional pool tuning through `PoolConfig`, an optional application name forwarded to the server, and optional per-connection timeouts through `SessionConfig`.
+
+```rust
+use arcature::database::{DatabaseConfig, Db, PoolConfig, SessionConfig};
+
+let config = DatabaseConfig::new(&std::env::var("DATABASE_URL")?)?
+    .pool(PoolConfig::new().max_connections(20))
+    .application_name("acme")
+    .session(
+        SessionConfig::new()
+            .statement_timeout(std::time::Duration::from_secs(30))
+            .lock_timeout(std::time::Duration::from_secs(5)),
+    );
+
+let db = Db::connect(config).await?;
+```
+
+`Application::database(config)` performs this step during the application lifecycle and makes the resulting handle available through the state closure as `resources.db()`.
+
+`SessionConfig` sets per-connection PostgreSQL timeouts (`statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout`) applied each time a connection is established. `SessionConfig::none()` opts out entirely.
+
+<Accordion title="Db handle methods">
+
+| Method | Does |
+|---|---|
+| `db.orm()` | Borrows the SeaORM `DatabaseConnection` |
+| `db.sqlx()` | Borrows the underlying `Pool` |
+| `db.ping()` | Liveness check |
+| `db.close()` | Shuts the pool down gracefully |
+
+</Accordion>
+
+## Reaching the Handle from a Handler
+
+`Db` is not an Axum extractor. It lives in your application state, and handlers reach it through `State<AppState>`. The generated `AppState` holds `db: Option<Db>` because a subsystem that was never configured contributes `None` rather than panicking at startup.
+
+```rust
+use arcature::axum::extract::State;
+
+pub async fn index(State(state): State<AppState>) -> Result<Response> {
+    let db = state.db.as_ref().ok_or_else(|| not_found("no database"))?;
+    let users = user::Entity::query(db).all().await?;
+    Ok(json(&users))
+}
+```
+
+## Models
+
+A model is an ordinary SeaORM entity. SeaORM is re-exported as `arcature::database::sea_orm`, so there is no second version to keep in sync. The pattern SeaORM requires — a `Model` struct inside its own module, with `Entity`, `Column`, and `PrimaryKey` generated beside it — looks like this when written by hand:
+
+```rust
+pub mod user {
+    use arcature::database::sea_orm::entity::prelude::*;
+    use arcature::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "users")]
+    pub struct Model {
+        #[sea_orm(primary_key)
+        pub id: i64,
+        pub email: String,
+        pub name: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+```
+
+### The Short Path: `#[model]`
+
+The `#[model(table = "...")]` attribute macro generates the module above for you and re-exports the family under predictable names in the parent scope:
+
+```rust
+#[model(table = "users")]
+pub struct User {
+    #[sea_orm(primary_key)]
+    pub id: i64,
+    pub email: String,
+    pub name: String,
+}
+```
+
+This yields `User`, `UserEntity`, `UserActiveModel`, `UserColumn`, `UserPrimaryKey`, and `UserRelation`. `arc make:model` generates exactly this shape.
+
+<Note>
+`#[model]` is the short path, not the only one. Its generated `Relation` enum is empty and there is no syntax to fill it — a model that needs relations should be written as a plain SeaORM entity module. The query facade is a blanket impl over every SeaORM entity, so a hand-written entity gets it for free.
+</Note>
+
+A model is a database row. It is not browser-safe by virtue of deriving `Serialize` alone — converting it for the browser is an explicit `impl From<User> for UserResource`.
+
+## Querying
+
+Every SeaORM entity gains `Entity::query(&db)` through the blanket `QueryModel` impl. Bring the trait into scope with `use arcature::database::QueryModel`:
+
+```rust
+use arcature::database::QueryModel;
+
+let recent = user::Entity::query(&db)
+    .where_eq(UserColumn::Active, true)
+    .where_not_null(UserColumn::VerifiedAt)
+    .latest()
+    .limit(20)
+    .all()
+    .await?;
+
+let one = user::Entity::query(&db)
+    .where_eq(UserColumn::Email, "ada@example.com")
+    .one()
+    .await?;
+```
+
+Because `#[model]` also generates the row type as a top-level alias, you can start from `User::query(&db)` instead of `UserEntity::query(&db)`:
+
+```rust
+async fn admins(db: &Db) -> Result<Vec<User>> {
+    User::query(db).where_eq(UserColumn::Role, "admin").all().await
+}
+```
+
+### Predicates, Ordering, and Terminators
+
+| Category | Methods |
+|---|---|
+| **Filter** | `where_eq(col, val)`, `where_ne(col, val)`, `where_gt(col, val)`, `where_lt(col, val)`, `where_in(col, values)`, `where_null(col)`, `where_not_null(col)`, `filter(condition)` |
+| **Order** | `latest()`, `latest_by(col)`, `oldest()`, `order_by_asc(col)`, `order_by_desc(col)` |
+| **Window** | `limit(n)`, `offset(n)` |
+| **Terminate** | `all()`, `one()`, `count()` |
+
+`filter(condition)` accepts any raw SeaORM condition for cases the typed helpers do not cover.
+
+### Pagination
+
+`paginate(per_page)` returns a `Paginated` builder. Pages are 1-indexed.
+
+```rust
+let page = user::Entity::query(&db)
+    .where_eq(UserColumn::Active, true)
+    .latest()
+    .paginate(25)
+    .page(1)
+    .await?;
+
+// Fetch the page and the grand total in two statements.
+let (rows, total) = user::Entity::query(&db)
+    .paginate(25)
+    .page_with_count(2)
+    .await?;
+```
+
+## Writing
+
+The CRUD free functions take the `ActiveModel` and are imported from `arcature::database`:
+
+```rust
+use arcature::database::{delete, find_by_pk, insert, update};
+
+let created = insert(&db, user::ActiveModel { .. }).await?;
+let changed = update(&db, active_model).await?;
+delete(&db, active_model).await?;
+let found = find_by_pk::<user::Entity, _>(&db, 1_i64).await?;
+```
+
+## Transactions
+
+`Transaction` is a namespace, not a value. Both paths commit on `Ok` and roll back on `Err`. The closure returns a pinned boxed future because the borrow of the transaction must outlive the call.
+
+<Tabs>
+  <Tab title="SeaORM transaction">
+    ```rust
+    use arcature::database::Transaction;
+
+    Transaction::orm(&db, |txn| Box::pin(async move {
+        // Any SeaORM call against `txn`
+        let _ = insert(txn, user::ActiveModel { .. }).await?;
+        Ok(())
+    })).await?;
+    ```
+  </Tab>
+  <Tab title="SQLx transaction">
+    ```rust
+    use arcature::database::Transaction;
+
+    Transaction::sqlx(&db, |txn| Box::pin(async move {
+        sqlx::query("UPDATE accounts SET balance = balance - $1")
+            .bind(100_i64)
+            .execute(&mut **txn)
+            .await?;
+        Ok(())
+    })).await?;
+    ```
+  </Tab>
+</Tabs>
+
+## Route Model Binding
+
+`Bound<T>` is an Axum extractor that loads a model from a route parameter before the handler runs. It reads the path key, parses it (400 on parse failure), calls `RouteModel::load` (500 on a database error), and returns a 404 when the row is absent.
+
+Define the binding with `#[route_model]`:
+
+```rust
+#[arcature::route_model(entity = link::Entity, key = "id", key_type = i64)]
+pub struct Link(pub link::Model);
+
+pub async fn show(link: Bound<Link>) -> Result<Response> {
+    let link = link.into_inner();
+    Ok(json(&link.0))
+}
+```
+
+`Bound<T>` obtains its `Db` through the `DbFromState<S>` trait rather than Axum's `FromRef` — `FromRef` and `Db` are both foreign types and the blanket impl would collide with the orphan rule. Wire it with one line per application state type:
+
+```rust
+impl DbFromState<AppState> for Db {
+    fn db_from_state(state: &AppState) -> Db {
+        state.db.clone().expect("database configured")
+    }
+}
+```
+
+<Warning>
+Binding proves the row exists. It does **not** check that the current user may see it. Authorization is a separate, explicit step — call `auth.authorize::<T, Policy>("action", &value)?` after extracting the bound model.
+</Warning>
+
+For a lookup that is not a primary-key `find_by_id` — a slug scoped to a tenant, for example — implement `RouteModel` by hand. The macro covers the common case and stops there.
+
+## Migrations
+
+Migrations use the SeaORM migration API. Arcature wraps the four operations behind a clean interface:
+
+```rust
+use arcature::database::migration;
+
+migration::up::<Schema>(&db).await?;
+migration::down::<Schema>(&db, 1).await?;
+migration::fresh::<Schema>(&db).await?;
+let status = migration::status::<Schema>(&db).await?;
+```
+
+The CLI commands map directly to these:
+
+```bash
+arc migrate          # run pending migrations
+arc db:fresh         # drop and re-run all migrations
+arc db:reset         # fresh + seed
+arc db:seed          # run seeders
+arc make:migration   # scaffold a new migration file
+```
+
+## Driver Selection
+
+The database feature splits into three mutually exclusive compile-time drivers. Exactly one must be enabled — enabling more than one is a compile error.
+
+| Feature | Driver | Notes |
+|---|---|---|
+| `db-postgres` | PostgreSQL 17+ | Required for the job queue (`FOR UPDATE SKIP LOCKED`) |
+| `db-sqlite` | SQLite | Default for `arc new`; created on first connect, no server needed |
+| `db-mysql` | MySQL 8+ | Supported but without `SKIP LOCKED` job semantics |
+
+```toml
+# Cargo.toml
+arcature = { version = "0.1", features = ["database", "db-postgres"] }
+```
+
+## Escape Hatches
+
+Arcature does not own, reimplement, or rename SeaORM's query builder, relation engine, or transaction system. `Query` is a thin facade over `Select`; when the facade runs out, `db.orm()` and `db.sqlx()` are always available:
+
+```rust
+// Raw SeaORM query builder
+let result = SomeEntity::find()
+    .filter(Column::Status.eq("active"))
+    .one(db.orm())
+    .await?;
+
+// Raw SQLx
+let row = sqlx::query_as::<_, UserRow>("SELECT id, email FROM users WHERE id = $1")
+    .bind(42_i64)
+    .fetch_one(db.sqlx())
+    .await?;
+```
+
+SeaORM and SeaORM Migration are both re-exported from `arcature::database`, so downstream code targets the pinned versions through Arcature:
+
+```rust
+use arcature::database::sea_orm;
+use arcature::database::sea_orm_migration;
+use arcature::database::sqlx;
+```

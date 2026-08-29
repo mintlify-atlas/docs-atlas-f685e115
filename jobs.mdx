@@ -1,0 +1,271 @@
+---
+title: "Durable Background Jobs on PostgreSQL with Arcature"
+sidebarTitle: "Jobs"
+description: "Run at-least-once background jobs over your existing PostgreSQL pool. Covers job declaration, enqueueing, handlers, retry policies, scheduling, and the Worker configuration."
+---
+
+Arcature's job queue is a `FOR UPDATE SKIP LOCKED` queue built on top of your application's existing `PgPool` — no second connection pool, no separate broker to operate. Jobs are at-least-once, so a handler must be idempotent, but claims are fenced by a per-claim UUID so a stale worker waking up late cannot commit its result over another worker's active claim.
+
+<Note>
+The job queue requires **PostgreSQL**. `FOR UPDATE SKIP LOCKED` is the entire design, and SQLite and MySQL do not have a usable equivalent. An application using `db-sqlite` has the rest of the framework with no job queue.
+</Note>
+
+## Enabling the Feature
+
+Add the `jobs` feature to your `Cargo.toml`. It is included in the default feature set, but if you have disabled defaults:
+
+```toml
+[dependencies]
+arcature = { version = "0.1", features = ["jobs"] }
+```
+
+## Declaring a Job
+
+`arcature::Job` is an explicit import — it is not re-exported from the prelude. Add `#[derive(arcature::Job)]` alongside the standard serde derives:
+
+```rust
+use arcature::Job;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, arcature::Job)]
+struct SendVerificationEmail {
+    user_id: u64,
+}
+```
+
+The derive macro generates an `impl DxComponent` and a `JOB` const that describes the queue identity. Defaults are the struct name in `snake_case`, version `1`, and three max attempts:
+
+```rust
+assert_eq!(SendVerificationEmail::JOB.kind(), "send_verification_email");
+assert_eq!(SendVerificationEmail::JOB.version(), 1);
+assert_eq!(SendVerificationEmail::JOB.max_attempts(), 3);
+```
+
+Override any of these with the `#[job]` attribute:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize, arcature::Job)]
+#[job(kind = "custom_kind", version = 2, attempts = 5)]
+struct CleanupSessions {
+    user_id: u64,
+}
+```
+
+<Tip>
+`version` is part of the queue identity, not documentation. A handler registers for a `(kind, version)` pair, so bumping the version lets a new payload shape coexist with jobs already in the table rather than deserializing into the wrong struct.
+</Tip>
+
+## Enqueueing Jobs
+
+Build a `Jobs` facade from your pool, then construct a `JobRequest` and enqueue it:
+
+```rust
+use arcature::jobs::{JobRequest, Jobs};
+
+let jobs = Jobs::new(pool.clone());
+let request = JobRequest::new(
+    &SendVerificationEmail::JOB,
+    &SendVerificationEmail { user_id: 42 },
+)?;
+jobs.enqueue(&request).await?;
+```
+
+`JobRequest` exposes builder methods to control scheduling and retry behaviour:
+
+| Builder | Effect |
+| --- | --- |
+| `.delay(Duration)` | Run no earlier than `now + duration` |
+| `.run_at(DateTime<Utc>)` | Enqueue with an explicit `run_at` wall-clock time |
+| `.max_attempts(n)` | Override this job's attempt limit for this one request |
+
+### Transactional Enqueueing
+
+The safest way to enqueue a job is in the same transaction as the state change that caused it. Use `enqueue_tx` when you already hold a transaction:
+
+```rust
+let mut tx = pool.begin().await?;
+// ... mutate application state ...
+jobs.enqueue_tx(&mut tx, &request).await?;
+tx.commit().await?;
+```
+
+Enqueueing outside the transaction is the job that runs before its row exists — a race window that `enqueue_tx` closes.
+
+### Schema Migration
+
+```rust
+// Call once at startup (idempotent):
+jobs.migrate().await?;
+```
+
+## Writing Handlers
+
+Register a closure against the job model using `Registry::add`. The registry is mutable while you build it:
+
+```rust
+use arcature::jobs::{JobError, Registry};
+
+pub fn registry() -> Registry {
+    let mut registry = Registry::new();
+    registry
+        .add(&SendVerificationEmail::JOB, |job: SendVerificationEmail| async move {
+            send_email(job.user_id).await.map_err(JobError::retryable)
+        })
+        .expect("job kind is valid and registered once");
+    registry
+}
+```
+
+Registering the same `(kind, version)` pair twice is an error, not a silent overwrite.
+
+### Error Classification
+
+The handler decides what happens on failure. The framework cannot tell a bad payload from a flaky network:
+
+| Error type | Outcome |
+| --- | --- |
+| `JobError::Retryable` | Retry according to the backoff policy until `max_attempts` is exhausted |
+| `JobError::Permanent` | Mark the job dead immediately, no retries |
+
+Convenience constructors: `JobError::retryable(e)` and `JobError::permanent(e)` wrap any `std::error::Error`. `retryable_msg(s)` and `permanent_msg(s)` take a plain string.
+
+### The `#[job_handler]` Attribute
+
+`#[job_handler]` validates that a function is `pub async fn` with a valid return type and emits it unchanged. It does **not** register the handler — that stays explicit in application code, because the macro cannot see the job's `(kind, version)` from the payload struct.
+
+## Running a Worker
+
+```rust
+use std::time::Duration;
+use arcature::jobs::{RetryPolicy, Worker, WorkerConfig};
+use tokio_util::sync::CancellationToken;
+
+let worker = Worker::builder(pool.clone(), registry())
+    .worker_id("worker-1")
+    .config(WorkerConfig::default().concurrency(16))
+    .retry_policy(
+        RetryPolicy::exponential(Duration::from_secs(5), 2.0, Duration::from_secs(600))
+            .jitter(true),
+    )
+    .build();
+
+worker.run(CancellationToken::new()).await?;
+```
+
+`Worker::new(pool, registry)` skips the builder when the defaults are acceptable. `run` takes a `CancellationToken` and returns when it fires — shutdown sequencing is the caller's responsibility.
+
+### WorkerConfig Defaults
+
+| Setting | Default |
+| --- | --- |
+| `concurrency` | 8 concurrent jobs |
+| `poll_interval` | 200 ms |
+| `lease` | 300 s |
+| `poll_batch` | 8 jobs per poll |
+| `sweep_interval` | Every 30 s |
+| `sweep_batch` | 64 expired leases per sweep |
+| `per_job_timeout` | 60 s |
+| `heartbeat_interval` | `lease / 3` (derived) |
+
+## Retry Policies
+
+<Tabs>
+  <Tab title="Exponential Backoff">
+    ```rust
+    use std::time::Duration;
+    use arcature::jobs::RetryPolicy;
+
+    // base * multiplier^(attempts - 1), capped at max.
+    let policy = RetryPolicy::exponential(
+        Duration::from_secs(5),   // base delay
+        2.0,                       // multiplier
+        Duration::from_secs(600), // cap
+    )
+    .jitter(true); // full jitter to avoid lockstep retries
+    ```
+  </Tab>
+  <Tab title="Fixed Delay">
+    ```rust
+    use std::time::Duration;
+    use arcature::jobs::RetryPolicy;
+
+    let policy = RetryPolicy::fixed(Duration::from_secs(30))
+        .jitter(true);
+    ```
+  </Tab>
+</Tabs>
+
+`.jitter(true)` enables full jitter, which prevents a batch of simultaneous failures from retrying in lockstep and overwhelming a downstream service.
+
+A job that exhausts `max_attempts` becomes dead. The `arcature::jobs::admin` module exposes `requeue_dead`, `cancel`, and `sweep_expired_leases` for operator-level access.
+
+## Why Claims Are Fenced
+
+Every claim carries a per-claim UUID `claim_token`. Every completion mutation fences on `(id, status = 'running', claim_token)`.
+
+The reason is the lease. A worker claims a job for a bounded time; if it dies or stalls past the lease, the sweep requeues the job and another worker picks it up. Without the token, the first worker waking up late would write its result over the second worker's active claim. With the token, the stale worker's `UPDATE` matches zero rows and does nothing.
+
+At-least-once still means at-least-once. The fence stops a stale worker committing a result — it does not prevent the job body from running twice.
+
+## Scheduling Recurring Jobs
+
+```rust
+use arcature::jobs::{ScheduleBinding, ScheduleCadence, Scheduler};
+
+const NIGHTLY: ScheduleBinding = ScheduleBinding {
+    job: "cleanup_sessions",
+    version: 1,
+    cadence: ScheduleCadence::Daily { hour: 3, minute: 0 },
+};
+
+let scheduler = Scheduler::new().schedule(&NIGHTLY, move || {
+    let jobs = jobs.clone();
+    async move {
+        jobs.enqueue(&JobRequest::new(&CleanupSessions::JOB, &CleanupSessions { user_id: 0 })?)
+            .await
+    }
+});
+
+scheduler.run(CancellationToken::new()).await?;
+```
+
+`ScheduleCadence` is either an interval or a daily wall-clock time. The scheduler enqueues; the worker runs. They can be separate processes if that suits your deployment.
+
+## Observability
+
+`Observer` is the observability seam; the default is `NoopObserver`. Implement the trait and pass it to `WorkerBuilder::observer` to receive events for claims, completions, and failures:
+
+```rust
+use arcature::jobs::{Observer, SharedObserver};
+
+struct MyObserver;
+
+impl Observer for MyObserver {
+    // implement event hooks
+}
+
+let worker = Worker::builder(pool.clone(), registry())
+    .observer(SharedObserver::new(MyObserver))
+    .build();
+```
+
+## CLI Commands
+
+<CardGroup cols={2}>
+  <Card title="arc queue work" icon="play">
+    Start a worker with an empty registry. Useful for checking queue health — it will mark jobs with no handler as dead, not run them.
+  </Card>
+  <Card title="arc queue drain" icon="arrow-down-to-line">
+    Wait for all running jobs to finish, then exit.
+  </Card>
+  <Card title="arc queue stats" icon="chart-bar">
+    Print queue depth, in-flight jobs, and dead job counts.
+  </Card>
+  <Card title="arc schedule" icon="clock">
+    Run the scheduler process, enqueueing recurring jobs on their cadence.
+  </Card>
+</CardGroup>
+
+<Warning>
+`arc queue work` builds a worker with an empty registry. It sweeps expired leases and marks jobs it has no handler for as dead. Pointed at a queue with real application jobs, it will discard rows rather than run them. Use your application's own in-process worker for real dispatch.
+</Warning>

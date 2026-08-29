@@ -1,0 +1,362 @@
+---
+title: "Authentication, Sessions, and Authorization in Arcature"
+sidebarTitle: "Authentication"
+description: "AuthUser and UserLoader contracts, Argon2id hashing, session config, CSRF presets, sign-in flows, authorization policies, and the arc make:auth scaffold."
+---
+
+Arcature's `auth` module owns the integration seams, not your identity schema. There is no framework `User` table, no roles table, no permissions system baked in. You write the user type; Arcature gives it sessions, password hashing, extractors, CSRF protection, an authorization seam, and an optional set of sign-in flow helpers that cover the small decisions where the obvious implementation is silently wrong.
+
+## The User Contract
+
+Every authenticated application implements two traits: `AuthUser` on the model, and `UserLoader<AppState>` to reload it from the session.
+
+```rust
+use arcature::AuthUser;
+
+pub struct User {
+    pub id: uuid::Uuid,
+    pub email: String,
+    pub password_hash: String,
+}
+
+impl AuthUser for User {
+    type Id = uuid::Uuid;
+    const SESSION_KEY: &'static str = "user_id";
+
+    fn id(&self) -> &uuid::Uuid {
+        &self.id
+    }
+
+    // Return the stored credential so Arcature can invalidate sessions
+    // when the password changes — without this, a reset link hands the
+    // account back while an attacker's session keeps working.
+    fn stored_credential(&self) -> Option<&[u8]> {
+        Some(self.password_hash.as_bytes())
+    }
+}
+```
+
+`type Id` is what goes into the session — `Uuid`, `i64`, `String`, anything serializable. `SESSION_KEY` defaults to `"user_id"`. `stored_credential` is optional but important: Arcature stamps a SHA-256 digest of this value into the session at login and re-checks it on every authenticated request. When the password changes, every live session for that user is flushed automatically.
+
+Then tell the framework how to load a user back from its ID:
+
+```rust
+use arcature::auth::UserLoader;
+
+impl UserLoader<AppState> for User {
+    type Error = sea_orm::DbErr;
+
+    async fn load_user(id: &uuid::Uuid, state: &AppState) -> Result<Option<User>, DbErr> {
+        // query state.db
+        Ok(None) // Ok(None) = stale session → 401
+    }
+}
+```
+
+`Ok(None)` means the session is stale and the extractor answers 401. `Err` means the database failed — a different thing with a different status code.
+
+### The `absolute_max_age` override
+
+`absolute_max_age()` is an optional method on `AuthUser` that sets the maximum session lifetime measured from login time, regardless of activity. It defaults to 30 days. This is separate from the session layer's sliding inactivity timeout: one bounds how long a session can live in total, the other how long it can idle.
+
+## Extractors
+
+These Axum extractors are available in any handler once auth is wired up:
+
+| Extractor | Behaviour |
+| --- | --- |
+| `Auth<U>` | The signed-in user, or a 401 rejection |
+| `OptionalAuth<U>` | `Option<U>`, never rejects |
+| `AuthManager<U>` | Login, logout, session rotation |
+| `Session` | The session store |
+| `Flash` | Flash messages |
+| `CsrfToken` | The current CSRF token |
+
+```rust
+pub async fn dashboard(Auth(user): Auth<User>) -> Result<Response> {
+    Ok(text(StatusCode::OK, format!("hello {}", user.email)))
+}
+
+pub async fn maybe_profile(OptionalAuth(user): OptionalAuth<User>) -> Result<Response> {
+    match user {
+        Some(u) => Ok(json(&u.email)),
+        None => Ok(redirect().to("/login").into_response()),
+    }
+}
+```
+
+## Logging In and Out
+
+`AuthManager<U>` is the handler extractor for performing login and logout:
+
+```rust
+pub async fn store(
+    auth: AuthManager<User>,
+    input: Validated<LoginRequest>,
+) -> Result<Response> {
+    let req = input.into_inner();
+    let user = load_user_by_email(&req.email).await?;
+    auth.login(&user).await?;
+    Ok(redirect().to("/dashboard").into_response())
+}
+
+pub async fn destroy(auth: AuthManager<User>) -> Result<Response> {
+    auth.logout().await?;
+    Ok(redirect().to("/").into_response())
+}
+```
+
+`login` returns a `LoginBuilder`; awaiting it does the work. `.remember(true)` extends the session's max age for "keep me signed in" flows.
+
+<Note>
+Awaiting `login()` **always rotates the session ID** by calling `cycle_id` before binding the user. This is mandatory and not opt-in: the anonymous-to-authenticated transition is the exact point where a session-fixation attack would persist, so the ID always changes. You do not need to call `session.regenerate()` after `login()`.
+</Note>
+
+`logout` flushes the whole session rather than removing only the user key, preventing stale data from persisting in a newly anonymous session.
+
+## Password Hashing
+
+Arcature uses Argon2id from the audited `argon2` crate. No cryptography is reimplemented in the framework.
+
+```rust
+use arcature::auth::{
+    PasswordConfig, PasswordHasher, PasswordHashString, PasswordSecret,
+    RehashOutcome, verify_password,
+};
+
+// Hash a new password at registration.
+let hasher = PasswordHasher::new(PasswordConfig::default())?;
+let stored: String = hasher.hash(b"correct horse battery staple")?.to_string();
+
+// Verify at login.
+let parsed = PasswordHashString::new(&row.password_hash)?;
+verify_password(b"attempt", &parsed)?;
+
+// Check whether parameters have changed since this hash was written.
+if matches!(hasher.needs_rehash(&parsed), RehashOutcome::Rehash) {
+    // Re-hash transparently on next successful login.
+}
+```
+
+`PasswordSecret` wraps a plaintext password; `PasswordHashString` wraps a PHC-formatted stored hash. Both are secrecy-backed: `Debug` and `Display` never expose the secret, and the buffer zeroizes on drop. No plaintext password, signing key, or token appears in logs, error output, or a `Debug` line anywhere in the framework.
+
+## Sessions
+
+Arcature wraps tower-sessions and owns the cookie attributes and the signed cookie jar.
+
+```rust
+use std::time::Duration;
+use arcature::auth::{SameSite, SessionConfig, SessionKey};
+
+let key = SessionKey::generate()?;         // or SessionKey::from_bytes(&bytes)
+let config = SessionConfig::new(key.as_bytes())?
+    .with_cookie_name("acme_session")
+    .with_same_site(SameSite::Lax)
+    .with_max_age(Duration::from_secs(60 * 60 * 2))
+    .with_absolute_max_age(Duration::from_secs(60 * 60 * 24 * 7));
+
+let layer = config.into_layer(store)?;
+```
+
+`SessionConfig::dev(key)` relaxes `Secure` for plain HTTP in local development. `arc key:generate` produces a signing key and writes it to `.env`.
+
+The session store is yours to choose — any `tower_sessions::SessionStore`. The `session-store-db` feature provides `DbSessionStore`, which keeps sessions in your application's own database so a deploy does not sign everyone out. Use `MemoryStore` in tests.
+
+### Session Operations
+
+```rust
+pub async fn handler(session: Session) -> Result<Response> {
+    // Store a value.
+    session.put("last_seen", 1_700_000_000i64).await?;
+
+    // Read it back.
+    let value: Option<i64> = session.get("last_seen").await?;
+
+    // Read and remove in one step.
+    let taken: Option<i64> = session.forget("last_seen").await?;
+
+    // Rotate the session ID outside of a login (login does this automatically).
+    session.regenerate().await?;
+
+    // Destroy the entire session.
+    session.flush().await?;
+
+    Ok(no_content())
+}
+```
+
+`session.raw()` borrows the underlying tower-sessions `Session` for anything not exposed through the ergonomic wrapper.
+
+### Flash Messages
+
+`Flash` writes one-shot messages that are read and cleared on the next request:
+
+```rust
+pub async fn store(flash: Flash) -> Result<Response> {
+    flash.success("Item created.");
+    Ok(redirect().to("/items").into_response())
+}
+
+pub async fn index(flash: Flash) -> Result<Response> {
+    for msg in flash.messages() {
+        // msg.level: FlashLevel (Success, Error, Warning, Info)
+        // msg.body: String
+    }
+    Ok(/* render */)
+}
+```
+
+## Authorization
+
+Authorization is never automatic and never implied. Validation proves a request is well-formed; `Bound<T>` proves a row exists; neither says the user may act on it.
+
+```rust
+pub struct LinkPolicy;
+
+impl arcature::Policy<Link> for LinkPolicy {
+    type User = User;
+
+    fn check(user: &User, action: &str, link: &Link) -> bool {
+        match action {
+            "view" => true,
+            "update" => user.id == link.user_id,
+            _ => false,
+        }
+    }
+}
+```
+
+Call it through `Auth::authorize`:
+
+```rust
+pub async fn update(auth: Auth<User>, link: Bound<Link>) -> Result<Response> {
+    let link = link.into_inner();
+    auth.authorize::<Link, LinkPolicy>("update", &link)?;
+    // Both type parameters are required — Rust has no partial turbofish.
+    Ok(no_content())
+}
+```
+
+`false` from the policy becomes `AuthzError::Forbidden` (a 403 response). Both type parameters (`M` the model, `P` the policy) must be supplied; `authorize::<LinkPolicy>(..)` alone will not compile.
+
+<Accordion title="Sign-in Flows (auth-flows feature)">
+
+The `auth` module provides the cryptographic seams — hash a password, bind a user to a session. The `auth-flows` feature owns the handful of small, security-critical decisions that sit between those seams and a working login form: the ones where the obvious implementation is silently wrong.
+
+Enable it in `Cargo.toml`:
+
+```toml
+arcature = { version = "0.1", features = ["auth-flows"] }
+```
+
+| Type | What the naïve implementation leaks |
+| --- | --- |
+| `CredentialChecker` | Skipping Argon2 verification when the address is unknown makes response *time* a working list of who has an account |
+| `EmailVerification` | A link bound to the account rather than the address verifies whichever address the account holds when clicked |
+| `LoginThrottle` | Counting failures per account misses the real attack (one guess each against 10,000 accounts); per-account-only counting also lets anyone lock anyone else out |
+| `PasswordConfirmation` | A session boolean never says *when* the password was proved, and is inherited by whoever holds the session next |
+| `PasswordResets` (`auth-reset`) | "Check then delete" is two statements with a gap; two concurrent requests both pass the validity check |
+| `RememberTokens` (`auth-remember`) | A non-rotating remember-me cookie cannot distinguish a returning user from a stolen one |
+
+Each type documents its own attack in full. These are the decisions that are the same in every application and where being wrong is silent — which together is the reason they are here rather than in your codebase.
+
+`PasswordResets` requires the `auth-reset` feature (brings a database table); `RememberTokens` requires `auth-remember` (also brings a table).
+
+</Accordion>
+
+<Accordion title="Scaffolding with arc make:auth">
+
+`arc make:auth user` writes the account model, controllers, routes, and migration — headless, no screens:
+
+```bash
+arc make:auth user
+```
+
+| Generated file | Contains |
+| --- | --- |
+| `app/auth/user.rs` | The account model, `AuthUser`, and `UserLoader` impls |
+| `app/auth/user_registration_controller.rs` | Sign-up handler |
+| `app/auth/user_session_controller.rs` | Sign-in and sign-out handlers |
+| `app/auth/user_password_controller.rs` | Forgotten-password and reset handlers |
+| `app/auth/user_routes.rs` | `user_auth_routes()` route collection |
+| `database/migrations/m<stamp>_create_users.rs` | The users table migration |
+
+Every file is declared as it is written, so no `pub mod` line needs adding by hand. Four things are not wired automatically and are noted in the generated files:
+
+1. `auth-flows` and `auth-reset` must be added to your feature list manually
+2. The migration must be registered in `Migrator::migrations()`
+3. `PasswordResets::new(pool).migrate()` owns the reset-tokens table separately
+4. `user_auth_routes()` must be merged into `bootstrap/app.rs`
+
+Use `arc make:page` or `arc make:view` for the screens — `make:auth` is intentionally headless.
+
+</Accordion>
+
+<Accordion title="CSRF Protection">
+
+`CsrfLayer` enforces a double-submit token. Not signed, not session-bound: the server issues a random nonce in a cookie, the client echoes it in a header, and the server compares the two. The strength is in the cookie attributes, not in a signature.
+
+**What is exempt by design:**
+- Safe methods (`GET`, `HEAD`, `OPTIONS`, `TRACE`) — these receive a fresh cookie if the request did not carry one
+- Bearer-token requests — `Authorization: Bearer …` is not sent automatically by a browser, so there is nothing to forge
+
+Unsafe non-bearer methods (`POST`, `PUT`, `PATCH`, `DELETE`) must present matching cookie and header, or receive a 403.
+
+### Three presets
+
+| Preset | Cookie name | Header name | Secure | SameSite |
+| --- | --- | --- | --- | --- |
+| `CsrfConfig::new()` | `__Host-csrf` | `x-csrf-token` | yes | Strict |
+| `CsrfConfig::dev()` | `arcature-csrf` | `x-csrf-token` | no | Strict |
+| `CsrfConfig::inertia()` | `XSRF-TOKEN` | `x-xsrf-token` | yes | Lax |
+
+`new()` is the strongest. The `__Host-` prefix mandates `Secure`, forbids `Domain`, and pins the path to `/`, so a sibling subdomain cannot overwrite the cookie. `SameSite=Strict` keeps it off every cross-site request. `HttpOnly` is intentionally false — JavaScript has to read the cookie to put it in the header.
+
+### Why Inertia applications use `inertia()`
+
+Inertia uses axios, which reads a cookie named `XSRF-TOKEN` and echoes it in `X-XSRF-TOKEN` — both are hard-coded and not configurable without writing application JavaScript. Against `CsrfConfig::new()`, every Inertia form is rejected with 403. The server moves to meet the client rather than requiring a shim.
+
+Two attributes weaken deliberately under `inertia()`:
+- No `__Host-` prefix (axios does not look for one)
+- `SameSite=Lax` rather than `Strict` (Strict blocks OAuth callbacks and email links arriving at the first page load; Lax sends the cookie on top-level GET navigations, which CSRF does not exploit)
+
+### Keeping `new()` with a custom axios config
+
+If you prefer the stronger cookie attributes, configure axios yourself — no framework package is needed:
+
+```js
+import axios from "axios";
+
+axios.defaults.xsrfCookieName = "__Host-csrf";
+axios.defaults.xsrfHeaderName = "X-CSRF-Token";
+```
+
+### Overriding individual attributes
+
+```rust
+use arcature::auth::{CsrfConfig, SameSite};
+
+let config = CsrfConfig::new()
+    .with_cookie_name("__Host-app-csrf")
+    .with_header_name("x-app-csrf")
+    .with_same_site(SameSite::Lax)
+    .with_secure(true)?;
+```
+
+`with_cookie_name` auto-enables `Secure` when the name starts with `__Host-`. `with_secure(false)` returns an error if the name carries that prefix — the invalid combination is not representable.
+
+### What CSRF does not defend against
+
+CSRF does not defend against XSS — same-origin script can read the cookie and send the header. It does not defend against anything the reverse proxy owns (TLS, rate limiting, request-size limits). It defends against forged cross-site unsafe requests from an authenticated browser, which is the attack it is named after.
+
+</Accordion>
+
+## API Tokens (api-tokens feature)
+
+For clients that have no cookie — a CLI, a CI job, another service — the `api-tokens` feature issues opaque bearer credentials. The plaintext is shown once; the database holds only a SHA-256 digest. Tokens carry abilities and a mandatory expiry.
+
+This feature is deliberately independent of `auth`: an API with no passwords and no sessions may still issue tokens. See the [API Tokens](/api-tokens) page for full coverage.
+
+<Tip>
+Secrets are never logged. Every credential type in `arcature::auth` — `PasswordSecret`, `PasswordHashString`, `SessionKey` — uses `secrecy`-backed storage whose `Debug` and `Display` implementations redact the value and whose `Drop` zeroizes the buffer.
+</Tip>

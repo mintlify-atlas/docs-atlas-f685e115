@@ -1,0 +1,137 @@
+---
+title: "In-Process Typed Event Dispatch in Arcature"
+sidebarTitle: "Events"
+description: "Dispatch strongly-typed events to registered listeners within a single process. Covers event declaration, listener registration, error handling, and the recording dispatcher for tests."
+---
+
+Arcature's event system provides in-process typed dispatch — not a message bus, not durable, and not cross-process. If the process dies mid-dispatch, any remaining listeners do not run. For work that must survive a restart, use the [Jobs](jobs) queue instead; the common pattern is a listener that enqueues a job, bridging the two systems.
+
+## Declaring an Event
+
+`arcature::Event` is an explicit import, not in the prelude. Combine it with serde's `Serialize` and `Deserialize` derives, since dispatch erases the type through `serde_json::Value`:
+
+```rust
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, arcature::Event)]
+pub struct UserRegistered {
+    pub user_id: u64,
+    pub email: String,
+}
+```
+
+The derive generates `impl DxComponent` with `NAME = "UserRegistered"` and the empty `impl Event`. The dispatch key is a `&'static str` name — not a `TypeId` — which means it describes itself to tooling and no downcast can silently miss.
+
+<Note>
+Dispatch serializes once to `serde_json::Value` and deserializes once per listener. This is deliberate over `TypeId`/`Any`: the string name is stable across crate boundaries and visible to introspection tooling. The cost is one JSON round-trip per listener.
+</Note>
+
+## Registering Listeners
+
+Create a `Dispatcher` and chain `register` calls to add listeners. `register` consumes and returns the dispatcher, so registration chains cleanly:
+
+```rust
+use arcature::events::{DispatchError, Dispatcher};
+
+let dispatcher = Dispatcher::new()
+    .register(|event: UserRegistered| async move {
+        println!("welcome {}", event.email);
+        Ok(())
+    });
+```
+
+Multiple listeners can share an event type; they run in registration order. Listeners are `Fn(E) -> Future<Output = Result<(), DispatchError>> + Send + Sync + 'static`.
+
+### The `#[listener]` Attribute
+
+`#[arcature::listener(UserRegistered)]` marks a free function as a listener and emits a `LISTENER_BINDING` const beside it for introspection by the Unified Application Graph:
+
+```rust
+#[arcature::listener(UserRegistered)]
+pub async fn send_welcome_email(
+    event: UserRegistered,
+) -> Result<(), arcature::events::DispatchError> {
+    let _ = event;
+    Ok(())
+}
+
+assert_eq!(LISTENER_BINDING.event, "UserRegistered");
+assert_eq!(LISTENER_BINDING.listener, "send_welcome_email");
+```
+
+The function is emitted unchanged and remains directly callable. The macro does **not** register it — you still pass it to `Dispatcher::register`. The binding const is metadata, not a registry that wires itself.
+
+## Dispatching Events
+
+```rust
+dispatcher
+    .dispatch(&UserRegistered { user_id: 1, email: "a@b.com".into() })
+    .await?;
+```
+
+Listeners run sequentially in registration order. A listener failure does **not** stop the others: the error is logged to stderr, every listener still runs, and `dispatch` returns the first error afterward. Dispatching an event with no listeners is a no-op returning `Ok(())`.
+
+<Warning>
+Listeners are sequential and in-process, so a slow listener delays the request that dispatched the event. Listeners should be short. Anything with latency — sending mail, making an HTTP call, writing a file — belongs in a job.
+</Warning>
+
+## Error Handling
+
+`DispatchError` has three variants, each designed with a specific disclosure policy:
+
+| Variant | Carries | Rationale |
+| --- | --- | --- |
+| `Serialize(String)` | The serde error message | Not the event payload |
+| `Deserialize` | **Nothing** | Serde errors can echo the payload; the message is dropped to prevent information disclosure |
+| `Listener(String)` | Whatever the listener chose to expose | The listener decides what to surface |
+
+The silent `Deserialize` variant is intentional. An event payload is exactly the kind of data that should not end up in a log line.
+
+## Testing with a Recording Dispatcher
+
+`Dispatcher::recording()` creates a dispatcher that records every dispatched event name in memory. Use it in tests to assert on side effects without needing to inspect listener internals:
+
+```rust
+let dispatcher = Dispatcher::recording();
+dispatcher
+    .dispatch(&UserRegistered { user_id: 1, email: "a@b.com".into() })
+    .await?;
+
+assert!(dispatcher.was_dispatched("UserRegistered"));
+
+let all = dispatcher.dispatched_events();
+assert_eq!(all, vec!["UserRegistered"]);
+```
+
+In a non-recording dispatcher, `was_dispatched` always returns `false` and `dispatched_events` returns an empty `Vec`. Recording is opt-in — production pays nothing for it.
+
+Additional introspection in test mode:
+
+```rust
+// Count listeners for a given event type:
+assert_eq!(dispatcher.listener_count("UserRegistered"), 1);
+```
+
+## Wiring Into Application State
+
+Because `Dispatcher` is `Clone`, the typical pattern is to build it once at startup and store it in your Axum application state:
+
+```rust
+use arcature::events::Dispatcher;
+
+#[derive(Clone)]
+struct AppState {
+    dispatcher: Dispatcher,
+    // ...
+}
+
+let state = AppState {
+    dispatcher: Dispatcher::new()
+        .register(|event: UserRegistered| async move {
+            // enqueue a job, update a read model, etc.
+            Ok(())
+        }),
+};
+```
+
+Handlers extract the dispatcher from state and call `dispatch` — there are no globals and no implicit wiring.

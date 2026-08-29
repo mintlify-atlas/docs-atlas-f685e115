@@ -1,0 +1,311 @@
+---
+title: "Multi-Channel Notifications in Arcature"
+sidebarTitle: "Notifications"
+description: "Send one event to one person over mail, an in-app inbox, and a live push. Covers the Notification trait, Notifier wiring, delivery ordering, the database inbox, and queue deferral."
+---
+
+The `notifications` feature implements a single-event, multi-channel delivery system: one notification reaches a recipient over whichever channels apply — an email, a row in an in-app inbox, and a live push to any open connection. A `Notifier` is a value you build at startup; nothing in `Application` constructs one for you.
+
+The system is not enabled by default. Enable the features you need in `Cargo.toml`:
+
+```toml
+[dependencies]
+arcature = { version = "0.1", features = [
+    "notifications",           # mail channel + core types
+    "notifications-db",        # in-app inbox (adds a table)
+    "notifications-broadcast", # live push over WebSocket/SSE
+    "notifications-queue",     # defer mail to the job queue
+] }
+```
+
+## The Notification Trait
+
+A notification is a type that knows how to render itself for each channel. Every channel method defaults to `None`, so implementing a single channel is enough to compile, and adding a new channel later is additive:
+
+```rust
+use arcature::notifications::{MailContent, Notification, Recipient};
+
+struct InvoicePaid {
+    amount_cents: i64,
+}
+
+impl Notification for InvoicePaid {
+    fn to_mail(&self, recipient: &Recipient) -> Option<MailContent> {
+        // No address, no mail — and no error, because this notification
+        // is genuinely not a mail notification for this person.
+        recipient.email_address()?;
+
+        Some(MailContent::new(
+            "Your invoice is paid",
+            format!(
+                "We received {}.{:02}. Thank you!",
+                self.amount_cents / 100,
+                self.amount_cents % 100
+            ),
+        ))
+    }
+}
+```
+
+The three channel methods and their content types:
+
+| Method | Returns | Channel |
+| --- | --- | --- |
+| `to_mail(&self, recipient)` | `Option<MailContent>` | `Channel::Mail` |
+| `to_database(&self, recipient)` | `Option<DatabaseContent>` | `Channel::Database` |
+| `to_broadcast(&self, recipient)` | `Option<BroadcastContent>` | `Channel::Broadcast` |
+
+There is no `via()` method. A notification reaches a channel exactly when that channel's method returns `Some`. The per-recipient decision `via($notifiable)` exists to make is available in the same place that produces the content — each method receives the `Recipient`.
+
+## Content Types
+
+<Accordion title="MailContent — email subject and body">
+```rust
+use arcature::notifications::MailContent;
+
+// Plain-text body is mandatory; HTML is optional.
+let content = MailContent::new("Welcome", "Welcome to Acme, Ada.")
+    .html("<p>Welcome to Acme, <strong>Ada</strong>.</p>");
+
+assert_eq!(content.subject(), "Welcome");
+assert_eq!(content.text(), "Welcome to Acme, Ada.");
+assert!(content.html_body().is_some());
+```
+
+Plain text is the mandatory argument — an HTML-only email is unreadable in text clients and is a spam signal. `html_body()` returns `None` until `.html(..)` is called; the last call wins.
+</Accordion>
+
+<Accordion title="DatabaseContent — in-app inbox row">
+```rust
+use arcature::notifications::DatabaseContent;
+
+// `new` is infallible: pass a serde_json::Value.
+let content = DatabaseContent::new(
+    "invoice.paid",
+    serde_json::json!({ "amount_cents": 1250 }),
+);
+
+// `serializing` handles typed structs and returns the serde error.
+let content = DatabaseContent::serializing("invoice.paid", &my_struct)?;
+```
+
+The `kind` string is your application's own vocabulary — `"invoice.paid"`, `"mention"` — not a Rust type path. It is stored in the database and matched by the front end, so a `refactor: rename` on the struct should not silently change the stored kind.
+</Accordion>
+
+<Accordion title="BroadcastContent — live push payload">
+```rust
+use arcature::notifications::BroadcastContent;
+
+let content = BroadcastContent::new(
+    "mention",
+    serde_json::json!({ "by": "ada" }),
+);
+```
+
+`BroadcastContent` and `DatabaseContent` carry the same fields deliberately as two separate types. A live push is usually a small toast or a badge count; an inbox row can afford detail. A notification that wants them identical builds both from the same value.
+
+What reaches the browser: `{"kind": <kind>, "data": <data>}` verbatim. Nothing filters on the way out.
+</Accordion>
+
+## Recipients
+
+Implement `Notifiable` on your user type to provide a `Recipient`:
+
+```rust
+use arcature::notifications::{Notifiable, Recipient};
+
+struct User {
+    id: i64,
+    email: String,
+}
+
+impl Notifiable for User {
+    fn recipient(&self) -> Recipient {
+        Recipient::new(format!("user:{}", self.id)).email(&self.email)
+    }
+}
+```
+
+A `Recipient` is a stable key plus whatever a channel needs. The key follows the same `"type:id"` shape the rest of the framework uses for subjects — API tokens, audit lines, and inbox rows all name the same person the same way. A fresh `Recipient` has no email address; `email_address()` returns `None` until `.email(..)` is called.
+
+`Recipient` itself implements `Notifiable`, so `notifier.send(&recipient, ..)` works without a wrapper type.
+
+## Wiring the Notifier
+
+`Notifier::new()` starts with no channels. Each `with_*` method adds one:
+
+```rust
+use arcature::jobs::Jobs;
+use arcature::mail::Mail;
+use arcature::notifications::{
+    BroadcastNotifications, DatabaseNotifications, NotificationQueue,
+    Notifier, PerRecipientChannels,
+};
+
+let channels = PerRecipientChannels::new(64).expect("capacity is non-zero");
+
+let notifier = Notifier::new()
+    .with_mail(Mail::new(mailer, "noreply@example.com".parse()?))
+    .with_database(DatabaseNotifications::new(pool.clone()))
+    .with_broadcast(BroadcastNotifications::new(channels.clone()))
+    .with_queue(NotificationQueue::new(Jobs::new(pool.clone())));
+```
+
+Each `with_*` past `with_mail` is gated on its own feature. `has_mail()`, `has_database()`, `has_broadcast()`, and `has_queue()` report what is wired. `Notifier` is cheap to clone and its `Debug` prints one boolean per channel — never credentials from behind them.
+
+## Sending
+
+```rust
+let delivery = notifier.send(&user, &InvoicePaid { amount_cents: 1250 }).await?;
+
+assert!(delivery.reached(Channel::Mail));
+assert!(!delivery.is_empty());
+```
+
+The delivery order is part of the contract: **inbox first, then live push, then mail**. The durable local record is written before anything leaves the process. An SMTP server that is down leaves the notification visible in the in-app inbox rather than losing it along with the email.
+
+`Delivery` is returned so that "reached nobody" is observable, not silent:
+
+| Call | Answers |
+| --- | --- |
+| `delivery.channels()` | Channels that ran, in the order they were tried |
+| `delivery.reached(channel)` | Whether that channel ran |
+| `delivery.queued()` | Channels handed to the job queue instead |
+| `delivery.is_queued(channel)` | Whether that channel was queued rather than run |
+| `delivery.is_empty()` | Whether nothing ran and nothing was queued |
+
+`Channel::Broadcast` appears in `channels()` only when at least one connection actually received the push. A recipient who is not connected is the ordinary state — it is reported as the channel not having run, not as a failure.
+
+### Nothing Is Delivered Quietly
+
+Asking for a channel the notifier was never given returns `NotificationError::NotConfigured` rather than silently skipping it. A forgotten `.with_mail(..)` at startup fails on the first send, not when someone notices password-reset emails never arrived.
+
+## The Feature Matrix
+
+| Feature | Implies | Adds |
+| --- | --- | --- |
+| `notifications` | `mail` | Core types, `Notification`, `Recipient`, `Notifiable`, `Notifier`, mail channel |
+| `notifications-db` | `notifications`, `database` | `DatabaseNotifications`, `StoredNotification`, `NotificationId`, in-app inbox table |
+| `notifications-broadcast` | `notifications`, `realtime` | `BroadcastNotifications`, `PerRecipientChannels`, live push channel |
+| `notifications-queue` | `notifications`, `jobs` | `Notifier::queue`, `NotificationQueue`, `MAIL_JOB`, `register_mail_handler` |
+
+## The In-App Inbox (`notifications-db`)
+
+`notifications-db` adds the `arcature_notifications` table. Enabling the feature is not enough — the schema must be created:
+
+```rust
+let inbox = DatabaseNotifications::new(pool.clone());
+inbox.migrate().await?; // idempotent; safe to call from every replica
+```
+
+### Reading and Writing
+
+```rust
+// Store a notification directly (normally done via Notifier::send):
+let row = inbox
+    .store("user:42", &DatabaseContent::new("invoice.paid", serde_json::json!({ "amount": 42 })))
+    .await?;
+
+// Inbox queries:
+let unread_count = inbox.unread_count("user:42").await?;       // u64
+let page = inbox.inbox("user:42", 20).await?;                  // newest first
+let unread = inbox.unread("user:42", 20).await?;               // unread only
+
+// Mark read:
+let changed = inbox.mark_read("user:42", row.id()).await?;     // bool
+let affected = inbox.mark_all_read("user:42").await?;          // u64
+
+// Delete:
+let deleted = inbox.delete("user:42", row.id()).await?;        // bool
+let pruned = inbox.prune_read_before(cutoff).await?;           // u64 across all recipients
+```
+
+`limit` is mandatory on listing queries — an unbounded inbox read is a memory spike waiting for the long-lived account that has ten thousand notifications.
+
+Every method that operates on a specific notification takes the recipient key alongside the ID. The key is in the `WHERE` clause, not checked in Rust afterward. Passing someone else's notification ID returns `false` — there is no statement in the store reachable by ID alone.
+
+`StoredNotification` exposes: `id()`, `notifiable_key()`, `kind()`, `data()`, `read_at()`, `is_read()`, and `created_at()`. Match on `kind()` first, then deserialize `data()` — the rows in one query were written by different notifications with different shapes.
+
+### Schema Highlights
+
+The `notifiable_key` column is not a foreign key. Notifications outlive soft-deletes and account merges rather than vanishing with them. `read_at` is nullable — null is the whole meaning of unread. There is no expiry column; retention is the application's decision via `prune_read_before`.
+
+## The Live Push Channel (`notifications-broadcast`)
+
+`notifications-broadcast` pushes to whoever is connected right now. Because the realtime `Broadcast` is a flat fanout to everyone subscribed, the broadcast channel is not a single channel but a `BroadcastChannels` resolver that maps a recipient key to that recipient's dedicated `Broadcast`:
+
+```rust
+pub trait BroadcastChannels: Send + Sync + fmt::Debug {
+    fn channel_for(&self, notifiable_key: &str) -> Option<Broadcast>;
+}
+```
+
+Targeting is then which channel the bytes go into, not a filter applied afterward. There is no code path that puts one recipient's notification into another's connection.
+
+`PerRecipientChannels` is the built-in resolver: one `Broadcast` per recipient key, created when the first connection subscribes:
+
+```rust
+let channels = PerRecipientChannels::new(64).expect("capacity is non-zero");
+
+// A WebSocket handler subscribes the connection it has accepted:
+let subscription = channels.subscribe("user:1");
+assert_eq!(channels.connections("user:1"), 1);
+// Dropping `subscription` releases the connection.
+```
+
+<Warning>
+The live push is per-process. `Broadcast` wraps a `tokio::sync::broadcast` channel — tasks inside one process. A push from a background worker (a different process) reaches nobody, because the worker holds none of the web process's sockets. An application running more than one instance should treat the push as an optimisation over the inbox, not a delivery guarantee. Enable `notifications-db` alongside `notifications-broadcast`.
+</Warning>
+
+## Queuing Mail Delivery (`notifications-queue`)
+
+`Notifier::queue` writes the rendered email to the job queue instead of talking to the SMTP server inline. The inbox row and the live push still run synchronously in the same call — only the part that leaves the machine is deferred:
+
+```rust
+let delivery = notifier.queue(&user, &InvoicePaid { amount_cents: 1250 }).await?;
+
+assert!(delivery.is_queued(Channel::Mail));
+assert!(!delivery.reached(Channel::Mail));  // a job row is not a delivery
+```
+
+`Notifier::send` is unchanged by wiring a queue — the two are separate methods so a handler opting to defer says so explicitly.
+
+To run queued notifications, register the mail handler in your worker process:
+
+```rust
+use arcature::jobs::Registry;
+use arcature::notifications::register_mail_handler;
+
+let mut registry = Registry::new();
+register_mail_handler(&mut registry, mail)?;
+```
+
+The job kind is `"arcature.notifications.mail"` version `1`, exported as `MAIL_JOB`. The web process enqueues against it; the worker registers a handler for it. The `Mail` given to the worker need not be the one the web process uses.
+
+<Warning>
+`arc queue work` builds a worker with an **empty registry**. It will mark notification mail jobs as dead rather than run them. Real dispatch requires your application's own worker with `register_mail_handler` called on its registry.
+</Warning>
+
+The queue is at-least-once. A worker that delivers the message to the SMTP server and then dies before marking the job complete leaves a row another worker will claim — the email arrives twice. This is inherent to writing across two systems; a notification whose second copy is harmful should not use this path.
+
+## Generating a Notification
+
+```bash
+arc make:notification InvoicePaid
+```
+
+Writes `app/notifications/invoice_paid.rs` implementing all three channel methods (each returning `None`), and registers the module. Delete the two channels that do not apply — that is how the decision is recorded. The generated `kind` string is a named constant (`const KIND: &str = "invoice.paid"`), not derived from the Rust type, so renaming the struct stays free.
+
+## Error Reference
+
+| Error | When |
+| --- | --- |
+| `NotConfigured { channel }` | Notification rendered content for a channel with no backing |
+| `NoAddress { key }` | Mail content for a recipient with no email address |
+| `Mail { source }` | SMTP transport refused or could not deliver |
+| `Database { source }` | Database rejected the inbox write (`notifications-db`) |
+| `Encode(String)` | Broadcast payload could not be serialized (`notifications-broadcast`) |
+| `Queue { source }` | Job row could not be written (`notifications-queue`) |
+| `QueueNotConfigured` | `Notifier::queue` called with no queue wired (`notifications-queue`) |
+| `IdCollision { attempts }` | Eight random 128-bit IDs were all taken (`notifications-db`) |
+| `Entropy` | OS randomness source was unavailable (`notifications-db`) |

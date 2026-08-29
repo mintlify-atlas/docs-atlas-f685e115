@@ -1,0 +1,158 @@
+---
+title: "Sending Email via SMTP with Arcature Mail"
+sidebarTitle: "Mail"
+description: "Send transactional email over SMTP using lettre and rustls. Covers the Mailable trait, Email builder, SmtpConfig, credential redaction, and in-memory capture for tests."
+---
+
+Arcature's mail subsystem integrates [lettre](https://lettre.rs/) for SMTP transport and [rustls](https://github.com/rustls/rustls) + aws-lc-rs for TLS. The framework owns the ergonomics; lettre owns the protocol. `Mail` is a value, not a namespace — the facade holds the mailer and the `From` address, so `mail.to(address).send(&mailable)` is the full send path.
+
+Enable the feature in `Cargo.toml` if you have disabled defaults:
+
+```toml
+[dependencies]
+arcature = { version = "0.1", features = ["mail"] }
+```
+
+## Configuring the Transport
+
+Build an `SmtpConfig`, then construct a `Mailer` from it:
+
+```rust
+use std::time::Duration;
+use arcature::mail::{Mailer, SmtpConfig, SmtpCredentials, TlsMode};
+
+let config = SmtpConfig::new("smtp.example.com")?
+    .port(587)
+    .tls_mode(TlsMode::StartTls)
+    .credentials(SmtpCredentials::new("user", "secret"))
+    .timeout(Duration::from_secs(10));
+
+let mailer = Mailer::smtp(config)?;
+```
+
+`SmtpConfig::from_url("smtps://user:pass@host:465")` parses a connection URL instead if you prefer that form.
+
+`Mailer` is `Clone + Send + Sync + 'static` and is designed to live in application state. `Application::mail(config)` builds one at startup.
+
+<Note>
+Credentials never reach a log. `SmtpCredentials` has a `Debug` impl that prints only the type name and deliberately has **no `Display`**. `SmtpConfig` implements both `Debug` and `Display` by hand and never emits the password or the full connection URL.
+</Note>
+
+## The Mailable Trait
+
+Implement `Mailable` on your message type. The `build` method receives an `Email` builder that already has `From` and `To` set — your implementation only needs to add content:
+
+```rust
+use arcature::mail::{Email, EmailError, Mailable};
+use arcature::mail::lettre::message::Message;
+
+pub struct WelcomeEmail {
+    pub name: String,
+}
+
+impl Mailable for WelcomeEmail {
+    fn build(&self, email: Email) -> Result<Message, EmailError> {
+        email
+            .subject(format!("Welcome, {}", self.name))
+            .plain(format!("Hi {}, welcome to the app!", self.name))
+    }
+}
+```
+
+## Sending Mail
+
+`Mail::from_str(mailer, from_address)` constructs the send facade, then chain `.to(address).send(&mailable)` to deliver:
+
+```rust
+use arcature::mail::Mail;
+
+let mail = Mail::from_str(mailer, "noreply@example.com")?;
+mail.to(user.email).send(&WelcomeEmail { name: user.name }).await?;
+```
+
+`Mail::new(mailer, mailbox)` accepts an already-parsed `lettre::address::Mailbox` if you have one. `parse_mailbox("Ada <ada@example.com>")` converts a string to a `Mailbox`.
+
+## The Email Builder
+
+`Email::builder()` starts a message. The header chainers (`from`, `reply_to`, `to`, `cc`, `bcc`, `subject`) all return `Self` and never fail. Only the body **terminators** return a `Result`, because that is where the message is assembled:
+
+```rust
+use arcature::mail::{Email, parse_mailbox};
+
+let message = Email::builder()
+    .from(parse_mailbox("noreply@example.com")?)
+    .to(parse_mailbox("ada@example.com")?)
+    .subject("Welcome")
+    .html("<h1>Welcome to Arcature</h1>")?;
+```
+
+### Body Terminators
+
+| Terminator | MIME type |
+| --- | --- |
+| `plain(body)` | `text/plain` |
+| `html(body)` | `text/html` |
+| `alternative(plain, html)` | `multipart/alternative` |
+| `plain_with_attachments(body, attachments)` | `text/plain` plus attachments |
+| `alternative_with_attachments(plain, html, attachments)` | Both body parts, plus attachments |
+
+When working with Inertia-rendered or template-rendered pages, use `alternative` to send both the plain-text fallback and the HTML version together.
+
+### Attachments
+
+```rust
+use arcature::mail::EmailAttachment;
+
+let pdf = EmailAttachment::new("invoice.pdf", pdf_bytes, "application/pdf");
+
+email
+    .subject("Your Invoice")
+    .plain_with_attachments("Please find your invoice attached.", vec![pdf])?;
+```
+
+`EmailAttachment::new(..)` has a `Debug` impl that redacts the body bytes — an attachment in a log line is a data leak, not a diagnostic.
+
+### Escape Hatch to lettre
+
+`Email::from_builder(builder)` and `email.into_builder()` convert to and from lettre's own `MessageBuilder` when the wrapper runs out of what you need. lettre is re-exported as `arcature::mail::lettre`.
+
+## Testing
+
+Use `Mailer::capture_ok()` to record every message in memory without opening a socket:
+
+```rust
+let mailer = Mailer::capture_ok();
+let mail = Mail::from_str(mailer.clone(), "noreply@example.com")?;
+mail.to("ada@example.com").send(&WelcomeEmail { name: "Ada".into() }).await?;
+
+let sent = mailer.captured().await.expect("capture mailer");
+assert_eq!(sent.len(), 1);
+
+let (envelope, raw_message) = &sent[0];
+// envelope.to() gives the resolved recipients
+```
+
+`captured()` returns `None` for an SMTP mailer and `Some(Vec<(Envelope, String)>)` for a capture mailer. `is_capture()` and `is_smtp()` let a startup guard refuse to run with a capture transport in production.
+
+Use `Mailer::capture_error()` to simulate a transport failure — it accepts the message but always returns an error. This exercises retry paths and error-handling code without needing an unreachable SMTP server:
+
+```rust
+let failing_mailer = Mailer::capture_error();
+let mail = Mail::from_str(failing_mailer, "noreply@example.com")?;
+let result = mail.to("ada@example.com").send(&WelcomeEmail { name: "Ada".into() }).await;
+assert!(result.is_err());
+```
+
+## What This Module Does Not Own
+
+SMTP, TLS, and cryptography are all lettre's and rustls's responsibility. Arcature owns the integration seam and the ergonomic wrapper; the certified rustls + aws-lc-rs stack owns the TLS handshake.
+
+## Notifications Sit on Top
+
+Mail is one channel. The `notifications` feature adds the layer above it: one event, told to one person, over whichever channels apply — mail plus an in-app inbox (`notifications-db`), a live push over WebSocket/SSE (`notifications-broadcast`), or mail handed to the job queue so the send does not block the request (`notifications-queue`).
+
+Reach for the [Notifications](notifications) layer when the same event has to arrive more than one way, or when "who gets told what" is a decision worth writing down once. A single transactional mail is what this chapter already covers.
+
+```bash
+arc make:notification InvoicePaid
+```

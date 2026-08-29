@@ -1,0 +1,157 @@
+---
+title: "Upgrading Arcature: Versioning and Migration Notes"
+sidebarTitle: "Upgrading"
+description: "How 0.x SemVer works with Cargo, what each optional feature costs, upgrade notes for every release, and the API surface most likely to change before 1.0."
+---
+
+Arcature follows Semantic Versioning with one twist that matters for Cargo: while the major version is `0`, the minor field is the breaking field. Understanding this before writing your dependency declaration prevents surprises at `cargo update` time.
+
+## Version semantics under 0.x
+
+```toml
+arcature = "0.1"
+```
+
+Cargo treats the leftmost non-zero field as the major version. Under `0.x` that is the minor, so `"0.1"` resolves `0.1.1` and `0.1.9` but refuses `0.2.0`. This is the protection a caret requirement gives at `1.x` — you get it for free with the standard spelling. An exact pin (`"=0.1.0"`) buys nothing here and costs you the patches. Raise the minor deliberately, with the changelog open.
+
+| Field | Increments when |
+|---|---|
+| `MAJOR` | Something breaks: a removed API, a changed signature, a changed default behaviour. Stays `0` until the API is frozen. |
+| `MINOR` | A compatible addition — **and**, while `MAJOR` is `0`, a breaking change too. |
+| `PATCH` | Something is fixed compatibly. No new feature flag, no removed item, no changed signature. |
+
+The current version is `0.1.3`, readable at runtime as `arcature::FRAMEWORK_VERSION`.
+
+<Note>
+**`0.1.0` restarted the version number.** The `arcature` name on crates.io carries earlier versions — `2026.0.0` through `2026.2.1` — published from a predecessor repository that spread the framework across thirteen crates and was then abandoned. This repository is a rewrite: no item, no feature name, and no crate boundary survives unchanged, so there is no migration path from `2026.x` and none is offered. Those four versions are yanked when `0.1.0` publishes — a yank removes a version from new resolution and leaves every existing lockfile resolving exactly as before.
+</Note>
+
+Once `1.0` is tagged, the breaking field moves back to the major and `arcature = "1"` becomes the safe requirement. Before `1.0` can be tagged, `test_kit`, `uag`, and `oauth` need to be exercised by real applications, and the "Not yet implemented" sections in the guide need to be empty or deliberately closed.
+
+## Reading the changelog before a minor bump
+
+[`CHANGELOG.md`](https://github.com/ArcatureLabs/Arcature/blob/main/CHANGELOG.md) follows Keep a Changelog format. Every breaking release has a `### Removed` or `### Changed` entry naming the API and the replacement. If a change requires work in an application, the entry says what the work is. A patch release is safe to take with `cargo update -p arcature` and no further reading.
+
+The parts of the API most likely to move before `1.0`:
+
+- **`AppConfig`** — carries `APP_NAME`, `APP_URL`, `APP_ENV`, and `APP_PORT`. `APP_PORT`, `APP_URL`, and `APP_NAME` are consumed as of `0.1.1`; `APP_ENV` is deliberately read by nothing (see Deployment).
+- **`arcature::test_kit`** — the youngest surface, least exercised by real applications.
+- **`uag`** and **`oauth`** — same reason.
+
+## Optional subsystem costs
+
+Every opt-in feature below is off in `default`. `fullstack` adds `uploads`, `views`, `storage-s3`, and the tooling features but leaves every row in this table off. Name what you want.
+
+| Feature | What it adds | Notable cost |
+|---|---|---|
+| `auth-flows` | Constant-time account lookup, login throttling, password confirmation | None — no new crate, no new table |
+| `auth-reset` | One-time password-reset links, stored as SHA-256 digests | Brings `arcature_password_resets` table + migration |
+| `auth-remember` | Rotating remember-me tokens with theft detection | Brings `arcature_remember_tokens` table + migration |
+| `api-tokens` | Hashed bearer tokens for CLIs, CI jobs, and service-to-service calls | Brings `arcature_api_tokens` table + migration |
+| `crypt` | `Encrypter`: XChaCha20-Poly1305 over a versioned, self-describing token | Key rotation story becomes your responsibility |
+| `signed-urls` | `UrlSigner`: links that carry their own origin proof and deadline | Separate from `crypt` — signing needs a MAC, not a cipher |
+| `uploads` | Multipart bodies, filename sanitizing, content-addressed names, magic-byte sniffing | Multipart parser on the request path |
+| `views` | Compiled Askama HTML views; templates are source, rebuilds required on edits | Askama template compiler at build time |
+| `i18n` | Fluent catalogs, locale negotiation against a whitelist | Runtime `.ftl` parser, `self_cell` with `unsafe` |
+| `session-store-db` | Sessions in your database — deploys do not log users out | Brings `arcature_sessions` table + migration |
+| `notifications` | One event, one recipient, many channels; implies `mail` | None beyond `mail` |
+| `notifications-db` | The in-app inbox channel | Brings notifications table + migration |
+| `notifications-broadcast` | Live push over WebSocket/SSE | Depends on `realtime` |
+| `notifications-queue` | Mail delivery handed to the job queue | Requires a running worker |
+| `otel` | OTLP span export over gRPC | `opentelemetry`, `opentelemetry_sdk`, `opentelemetry-otlp`, `tonic` |
+| `storage-s3` | S3-compatible object storage backend | `opendal` S3 feature |
+| `oauth` | OAuth 2 with PKCE | PKCE and token exchange logic |
+| `api-docs` | OpenAPI 3.1 generation from the route graph | Exposes the attack surface — do not ship in production without intent |
+
+Five features bring a table and a migration: `auth-reset`, `auth-remember`, `api-tokens`, `notifications-db`, and `session-store-db`. Each has its own idempotent migration, applied the same way job migrations are applied.
+
+## Upgrade notes
+
+### 0.1.2 → 0.1.3
+
+`cargo update -p arcature` takes it — nothing removed, no signature changed, no new feature flag.
+
+**Two behaviours change.** One is behind `otel`; the other reaches every application that calls `.trace_context()` on the default `observe` feature.
+
+<Accordion title="otel: incoming traceparent now becomes the exported trace ID">
+`TraceContextLayer` parsed the `traceparent` header and opened a span carrying `trace_id` and `parent_span_id` as fields, but never called `set_parent` — so `tracing-opentelemetry` minted a fresh trace ID for the exported span. A request arriving with a `traceparent` started a **new** trace at this service, and the caller's half and yours never met in the backend.
+
+The log side looked correct throughout (the IDs were present on log records), which is why this survived: there was simply no join happening. Under `otel`, the layer now builds a remote `SpanContext` from the parsed IDs and sets it as the span's parent.
+
+If you have been reading traces in a backend and wondering why an upstream call and its downstream never appear together, this is why. Expect traces that used to arrive as two disconnected roots to arrive as one. Nothing changes for a request that carried no `traceparent`.
+</Accordion>
+
+<Accordion title="observe: span attribution under concurrent handlers">
+`TraceContextService` ended with `let _entered = span.enter(); inner.call(request).await`. In async code a guard stays entered across every await point in the handler — including the ones where the task is parked and another request is running on that thread — so work belonging to other requests was recorded under this request's trace.
+
+The span is now attached with `Instrument`, which enters it only while this future is actually being polled.
+
+**This is not gated on `otel`.** If your application calls `.trace_context()`, the `trace_id`, `parent_span_id`, and `continued_trace` fields on log records emitted by concurrent handlers were sometimes another request's and are now this one's. A log query grouping records by `trace_id` returns a different — smaller, and correct — set than it did on `0.1.2`. A single-threaded or low-concurrency workload will see no change.
+</Accordion>
+
+### 0.1.1 → 0.1.2
+
+`cargo update -p arcature` takes it — nothing removed, no signature changed, no new feature flag.
+
+<Accordion title="SSE connections now count against the connection limit for their duration">
+`SseEndpoint::handle` acquired a `ConnectionGuard` and then wrote `let _ = guard;` — `_` is not a binding, so the guard dropped on that line. The cap gated admission only, and an application could hold any number of concurrent SSE connections open against a `ShutdownConfig::new(1)`.
+
+The `n + 1`th concurrent SSE stream now gets the `503` that its documentation always promised. If you sized `max_connections` against the old (unenforced) behaviour, re-check the number.
+
+`realtime::drain` is affected in the same direction: an open SSE stream is now visible to it and, if streams outlast the drain bound, it returns `Err(RealtimeError::Shutdown { remaining })`.
+</Accordion>
+
+<Accordion title="Handler log lines gain three new fields">
+`AccessLogService` built its request span and never entered it, so a handler's own `tracing::info!` inherited no `request_id`, `method`, `path`, or `client_ip`. The span is now attached to the inner call with `Instrument`.
+
+**Handler log lines gain `request_id`, `method`, `path`, and `client_ip`.** Anything parsing them against an exact key set will see the new keys appear.
+</Accordion>
+
+<Accordion title="Two new builder methods: .metrics() and .trace_context()">
+`ApplicationBuilder::metrics(registry)` installs the metrics layer at stage 9 (outside the admission stages). `ApplicationBuilder::trace_context()` installs the trace-context layer at stage 8.
+
+Previously both were only reachable through `.layer(..)`, which lands at stage 21 — inside the body limit, timeout, maintenance gate, and rate limiter. A counter there missed every `413`, `408`, `503`, and `429`.
+
+If you install either by hand today, switch:
+
+```diff
+- .layer(MetricsLayer::new(metrics.clone()))
+- .layer(TraceContextLayer)
++ .metrics(metrics.clone())
++ .trace_context()
+```
+
+Your request total will increase, because it now includes the refusals it was always supposed to count.
+</Accordion>
+
+### 0.1.0 → 0.1.1
+
+`cargo update -p arcature` takes it — nothing removed, no signature changed.
+
+<Accordion title="Page titles now derive from the PageContract name">
+A page rendered through a `PageContract` via `render_page` now derives its `<title>` from the contract's component name. Previously the `<title>` was the application title on every route.
+
+This only affects applications using a `#[page]` contract **and** one of the stock root documents. A hand-written `Fn(ScriptBody) -> String` root document is unaffected, as is `Inertia::render`. If you were relying on one shared title across all routes, set the head explicitly with `Inertia::with_head`.
+</Accordion>
+
+<Accordion title="IP rate limiter now keys on the actual caller address">
+`KeySource::Ip` previously had no client address to read and put every request into a single shared bucket — so a limiter configured per-IP was in practice a global one. It now resolves a real address.
+
+Expect the limiter to start doing what its configuration always said. If a limit was set per-IP and tuned against the old global behaviour, the effective ceiling is now that limit multiplied by your caller count — re-check the number.
+
+Addresses from `X-Forwarded-For` are trusted only from peers listed with `ApplicationBuilder::trusted_proxies`. The default list is empty: behind a reverse proxy, the address is your proxy's until you say otherwise.
+</Accordion>
+
+<Accordion title="Fourteen new opt-in features">
+Every one is off by default; nothing was removed; an existing build compiles unchanged. The fourteen features are listed in the optional subsystem table above. Five of them bring a table: `auth-reset`, `auth-remember`, `api-tokens`, `notifications-db`, and `session-store-db`. Apply their migrations in the order that makes sense for your application.
+
+One property of `auth-reset` worth stating plainly: **spending a reset link does not sign the account's other sessions out.** Sessions are keyed by session id and are not indexed by user. Use `AuthUser::stored_credential` (added in `0.1.1`) to invalidate all sessions for a user when their password changes.
+</Accordion>
+
+## The macro crate
+
+`arcature-macros` is versioned in lockstep with `arcature` and is not a separate upgrade decision. `arcature` depends on an exact version of it, and the release workflow publishes `arcature-macros` first. Do not depend on `arcature-macros` directly.
+
+## Upgrading the toolchain
+
+`rust-toolchain.toml` pins `stable` with `rustfmt` and `clippy`. The MSRV is `1.97.1` and CI builds on both it and current stable. An MSRV bump is a visible change to that file and to the CI matrix, not a silent consequence of using a new language feature. Arcature uses edition 2024.

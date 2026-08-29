@@ -1,0 +1,191 @@
+---
+title: "HTTP Routing in Arcature — Routes, Groups & Middleware"
+sidebarTitle: "Routing"
+description: "Define named routes, group them under shared prefixes, scope middleware at three levels, and generate type-safe URLs with the routes! macro."
+---
+
+Arcature's router is Axum's router — not a wrapper around it, but the same `axum::Router` populated from Arcature's `Routes` and `Route` values. Everything you can do with a raw Axum router is still available; the framework adds naming, URL generation, middleware scoping primitives, and a declarative `routes!` macro that emits typed compile-time metadata alongside the runtime table.
+
+## Defining routes
+
+`Routes::new` takes anything that implements `IntoRoutes`: a single `Route`, a `RouteGroup`, a fixed-size array, or a `Vec`. Each `Route` is constructed with a method name, a path, and a handler.
+
+```rust
+use arcature::prelude::*;
+
+pub fn routes() -> Routes {
+    Routes::new([
+        Route::get("/", home).name("home"),
+        Route::get("/links", index).name("links.index"),
+        Route::post("/links", store).name("links.store"),
+        Route::get("/links/{id}", show).name("links.show"),
+        Route::put("/links/{id}", update).name("links.update"),
+        Route::delete("/links/{id}", destroy).name("links.destroy"),
+    ])
+}
+```
+
+Constructors exist for `get`, `post`, `put`, `patch`, `delete`, `head`, and `options`. Anything outside that set falls through to Axum's `any` dispatcher.
+
+## Path parameters
+
+Paths follow Axum 0.8 syntax: `{id}` captures a segment. Extract it in the handler with Axum's `Path` extractor.
+
+```rust
+use arcature::axum::extract::Path;
+use arcature::prelude::*;
+
+async fn show(Path(id): Path<i64>) -> Result<Response> {
+    Ok(text(StatusCode::OK, format!("link {id}")))
+}
+```
+
+<Note>
+Use `{id}`, not `:id`. Arcature targets Axum 0.8, which uses curly-brace syntax. The colon form is an Axum 0.7 convention and will not match.
+</Note>
+
+## Named routes and URL generation
+
+Any route can be given a name with `.name("...")`. Names are dotted strings by convention (`"links.show"`, `"admin.users"`), but the format is unrestricted.
+
+```rust
+let url = routes.url_for("links.show", &["42"])?; // "/links/42"
+```
+
+Parameters are filled in **declaration order** — the same left-to-right order they appear in the path template. `url_for` returns `Err(Error::NotFound(..))` when the name was never declared, so a typo fails loudly at runtime rather than producing a silently broken link. `Routes::named()` iterates every registered name and its path template.
+
+## Route groups
+
+`RouteGroup` attaches a path prefix — and optionally middleware — to a set of routes. The prefix is joined onto each child's path when the group is flattened into the parent collection.
+
+```rust
+Routes::new([
+    RouteGroup::new("/admin", [
+        Route::get("/panel", panel).name("admin.panel"),
+        Route::get("/users", users).name("admin.users"),
+    ])
+    .middleware(RequireAuth),
+])
+```
+
+Groups can be nested: a `RouteGroup` is just another `IntoRoutes`, so passing one as a child of another is valid.
+
+## Middleware scoping
+
+Middleware attaches at three independent scopes, and the differences between them are structural, not cosmetic.
+
+| Scope | Call | What it covers |
+|---|---|---|
+| One route | `Route::middleware(m)` | that route only |
+| One group | `RouteGroup::middleware(m)` | each route in the group, individually |
+| A collection | `Routes::middleware(m)` | every route present **at the time of the call** |
+
+The reason the per-route scope works correctly is that `Route` holds a `MethodRouter`, not a folded `Router`. A `Router::layer` fold applies to everything already in the router — per-route middleware written that way would silently leak onto sibling routes. Layering a `MethodRouter` cannot reach past the single path it serves.
+
+The collection-level scope rule is what makes safe merging possible. Middleware applied before a merge does not spread onto collections merged in afterwards:
+
+```rust
+let guarded = Routes::new([/* ... */]).middleware(RequireAuth);
+let public  = Routes::new([/* ... */]);
+let all     = guarded.merge(public); // `public` routes are still public
+```
+
+## Writing middleware
+
+The `Middleware` trait is a `Clone` type whose `handle` method returns a boxed future. The `#[middleware]` attribute macro generates the implementation from an ordinary async function, leaving the function itself callable directly from tests.
+
+```rust
+use arcature::routing::{Request, Response};
+use arcature::{Next, Result, middleware};
+
+#[middleware]
+pub async fn require_auth(request: Request, next: Next) -> Result<Response> {
+    // Inspect the request, short-circuit with `Err(..)`, or continue:
+    Ok(next.run(request).await)
+}
+```
+
+The macro emits:
+- The function unchanged — `require_auth` is still a plain `async fn`.
+- A unit struct in PascalCase — `RequireAuth` — implementing `Middleware`.
+
+Override the struct name with `#[middleware(RequireAdmin)]`.
+
+For Tower middleware that is not a `Middleware` — a `tower_http` layer, for instance — `Route::layer`, `RouteGroup::layer`, and `Routes::layer` each accept a raw `tower::Layer`.
+
+## The `routes!` macro
+
+The builder API is the complete runtime. `routes!` is a declarative front end that additionally emits `&'static` metadata and typed URL helpers.
+
+```rust
+routes! {
+    pub app {
+        state: AppState;
+
+        get "/" => home { name: home, page: "Home" }
+
+        group "/auth" {
+            get  "/login" => login { name: auth.login }
+            post "/login" => store { name: auth.store }
+        }
+
+        group "/admin" {
+            middleware: [RequireAuth];
+            get "/panel" => panel { name: admin.panel }
+        }
+
+        resource "/links" => LinksController {
+            name: links,
+            only: [index, show, destroy]
+        }
+    }
+}
+```
+
+From `pub app`, the macro generates three artifacts:
+
+<CardGroup cols={3}>
+  <Card title="app_routes() → Routes" icon="route">
+    The runtime collection, built with the same builder API shown above. Pass it to `Application::routes`.
+  </Card>
+  <Card title="APP_ROUTES: &[RouteDescriptor]" icon="list">
+    A `&'static` const describing every route: method, path, handler name, declared page names. No startup registration.
+  </Card>
+  <Card title="app_route module" icon="link">
+    URL functions mirroring the dotted names. `app_route::auth::login()` returns `"/auth/login"`. Path parameters become function arguments — a missing argument is a compile error.
+  </Card>
+</CardGroup>
+
+### The `resource` shorthand
+
+`resource "/links" => LinksController { name: links, only: [index, show, destroy] }` expands to the conventional REST actions for that controller. The `only:` key selects a subset; omit it for all seven.
+
+| Action | Method | Path |
+|---|---|---|
+| `index` | GET | `/links` |
+| `show` | GET | `/links/{id}` |
+| `store` | POST | `/links` |
+| `update` | PUT | `/links/{id}` |
+| `patch` | PATCH | `/links/{id}` |
+| `destroy` | DELETE | `/links/{id}` |
+| `create` | GET | `/links/create` |
+
+### Typed URL helpers
+
+Each dotted name becomes a nested function. A path parameter becomes a required argument; the compiler rejects a call that passes the wrong type or omits a parameter entirely.
+
+```rust
+// No parameters:
+let url = app_route::home();           // "/";
+
+// One parameter — i64 enforced at compile time:
+let url = app_route::links::show(42); // "/links/42"
+```
+
+## Falling through to Axum
+
+`Routes::into_router` returns the underlying `axum::Router`. `Routes::router` borrows it. The escape hatch is visible and using it is not a defeat — the framework's opinions are meant to run out somewhere deliberate.
+
+<Tip>
+The router sits at stage 22 of Arcature's fixed pipeline. User `.layer()` calls land at stage 21, just outside the router. Static file serving is stage 23, reached only when the router does not match. The full pipeline order is documented in `src/application/pipeline.rs`.
+</Tip>

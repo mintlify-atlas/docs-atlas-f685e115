@@ -1,0 +1,175 @@
+---
+title: "Cache: Redis and Valkey Key-Value Store Integration"
+sidebarTitle: "Cache"
+description: "One multiplexed Redis/Valkey connection with typed get/set, atomic counters, TTL control, and a cache-aside helper that never silently falls through to the loader."
+---
+
+Arcature's cache subsystem wraps a single `redis-rs` `MultiplexedConnection` — not a pool. A multiplexed connection is cheap to clone, thread-safe, and sends all commands over one socket, so adding a second connection layer would buy nothing. `Cache` is a value with methods; you hold it in state and call it directly. There is no static `Cache::get` form.
+
+## Connecting
+
+`CacheConfig` takes a Redis or Valkey URL, an optional response timeout, an optional max payload size, and a `Namespace`. Credentials are redacted in the `Debug` impl — neither the password nor the full URL appears in logs.
+
+```rust
+use std::time::Duration;
+use arcature::cache::{Cache, CacheConfig, Namespace};
+
+let config = CacheConfig::new(&std::env::var("REDIS_URL")?)?
+    .response_timeout(Duration::from_secs(2))
+    .max_payload_size(Some(1024 * 1024)) // 1 MiB cap per value
+    .namespace(Namespace::new("acme")?);
+
+let cache = Cache::connect(config).await?;
+```
+
+`Application::cache(config)` performs this step during the application lifecycle. After that, `cache.ping()` checks liveness and `cache.close()` shuts the connection down.
+
+## Namespaces
+
+Every key is prefixed by the configured `Namespace`. `Namespace::new("acme")` makes every key become `acme:key` on the wire. The constructor rejects an empty prefix, a prefix ending in `:`, and control characters.
+
+`Namespace::none()` is the explicit opt-out. It is a distinct value rather than an absent field, so an unprefixed cache is a decision someone made rather than a configuration field nobody filled in.
+
+```rust
+use arcature::cache::Namespace;
+
+let ns = Namespace::new("payments")?; // keys become "payments:..."
+let no_ns = Namespace::none();        // keys are used as-is
+```
+
+## Operations
+
+All operations live on the `Cache` value. JSON operations serialize and deserialize automatically; the byte operations give you the raw wire value.
+
+| Method | Description |
+|---|---|
+| `get::<T>(key)` | Deserialize a JSON value; returns `None` when the key is absent |
+| `set(key, &value)` | Store a JSON value with no expiry |
+| `put(key, &value, ttl)` | Store a JSON value with a TTL |
+| `get_bytes(key)` | Retrieve the raw bytes stored at `key` |
+| `set_bytes(key, bytes)` | Store raw bytes with no expiry |
+| `set_bytes_with_ttl(key, bytes, ttl)` | Store raw bytes with a TTL |
+| `forget(key)` | Delete a key; returns the number of keys removed |
+| `exists(key)` | Check whether a key is present |
+| `incr(key, delta)` | Atomically increment a counter by `delta` |
+| `decr(key, delta)` | Atomically decrement a counter by `delta` |
+| `expire(key, ttl)` | Set or update the TTL on an existing key |
+| `ttl(key)` | Return the remaining TTL, or `None` if the key has no expiry |
+| `set_if_absent(key, bytes)` | Atomic compare-and-set: store only if the key does not exist |
+| `set_if_absent_with_ttl(key, bytes, ttl)` | Same, with a TTL applied on success |
+
+```rust
+use std::time::Duration;
+use arcature::cache::Cache;
+
+// Typed JSON round-trip
+cache.set("session:42", &session_data).await?;
+let session: Option<SessionData> = cache.get("session:42").await?;
+
+// Raw bytes
+cache.set_bytes("blob:123", raw_bytes).await?;
+let raw = cache.get_bytes("blob:123").await?;
+
+// Atomic counter
+cache.incr("rate:user:7", 1).await?;
+let current = cache.get::<i64>("rate:user:7").await?;
+
+// TTL management
+cache.put("token:abc", &token, Duration::from_secs(900)).await?;
+let remaining = cache.ttl("token:abc").await?;
+
+// Atomic set-if-absent (distributed mutex acquisition, idempotent writes)
+let claimed = cache
+    .set_if_absent_with_ttl("lock:job:99", b"worker-1", Duration::from_secs(30))
+    .await?;
+```
+
+## Cache-Aside with `remember`
+
+`remember` reads the key, and on a miss calls the loader closure, stores the result under the key with the TTL, and returns it. On a hit, the loader is never called.
+
+```rust
+use std::time::Duration;
+
+let user = cache
+    .remember("user:42", Duration::from_secs(300), || async {
+        load_user_from_db(42).await
+    })
+    .await?;
+```
+
+The loader's error type must implement `Into<CacheError>`. Check this before writing the closure: a loader that returns `sqlx::Error` or `sea_orm::DbErr` needs a conversion, or the closure needs to map it:
+
+```rust
+let report = cache
+    .remember("report:monthly", Duration::from_secs(3600), || async {
+        build_report()
+            .await
+            .map_err(|e| arcature::cache::CacheError::loader(e.to_string()))
+    })
+    .await?;
+```
+
+<Warning>
+A backend failure does **not** silently run the loader. If Redis or Valkey is unreachable, `remember` returns `CacheError::Backend` immediately. Arcature does not decide fail-open semantics on your behalf — silently degrading to the database under load is how a cache outage becomes a database outage. If you want the loader to run when the cache is down, handle `CacheError::Backend` explicitly before calling `remember`.
+</Warning>
+
+## Handling a Cache Down Gracefully
+
+When your application can tolerate a degraded cache, pattern-match on the error before reaching for `remember`:
+
+```rust
+use arcature::cache::CacheError;
+
+let result = cache
+    .remember("expensive:computation", Duration::from_secs(60), || async {
+        compute().await.map_err(CacheError::loader_string)
+    })
+    .await;
+
+let value = match result {
+    Ok(v) => v,
+    Err(CacheError::Backend(_)) => {
+        // Cache is down — run loader directly, accept higher latency.
+        compute().await?
+    }
+    Err(e) => return Err(e.into()),
+};
+```
+
+## Integrating with State
+
+`Cache` is `Clone + Send + Sync`, so it belongs in `AppState` the same way `Db` does:
+
+```rust
+pub async fn dashboard(State(state): State<AppState>) -> Result<Response> {
+    let cache = state.cache.as_ref().ok_or_else(|| not_found("no cache"))?;
+
+    let stats: Option<DashboardStats> = cache.get("dashboard:stats").await?;
+    let stats = match stats {
+        Some(s) => s,
+        None => {
+            let s = load_stats_from_db(&state).await?;
+            cache.put("dashboard:stats", &s, Duration::from_secs(120)).await?;
+            s
+        }
+    };
+
+    Ok(json(&stats))
+}
+```
+
+## What This Module Does Not Own
+
+The cache subsystem does not reimplement the Redis/RESP protocol, run a cache server, manage a connection pool, provide TLS, implement a distributed-lock subsystem, or provide a client-side caching layer. `redis-rs` is re-exported as `arcature::cache::redis` when you need the underlying client directly:
+
+```rust
+use arcature::cache::redis;
+
+// Direct redis-rs access for commands not in the Cache facade.
+let mut conn = cache.raw_connection().await?;
+let keys: Vec<String> = redis::cmd("KEYS")
+    .arg("acme:session:*")
+    .query_async(&mut conn)
+    .await?;
+```

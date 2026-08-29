@@ -1,0 +1,354 @@
+---
+title: "arc CLI — Complete Command Reference for Arcature"
+sidebarTitle: "CLI Commands"
+description: "Every arc subcommand with its flags, defaults, and feature requirements — from arc new and arc dev through arc build, arc typegen, and arc queue."
+---
+
+The `arc` binary is Arcature's single developer interface. It scaffolds projects, drives the development server, runs migrations, manages the job queue, and produces production builds. All behaviour is stateless: no daemon, no lock file, and no hidden configuration beyond what the current directory's `.env` contains. The binary is compiled from the same crate as the framework; `cargo install arcature --features cli --locked` builds it, or grab a pre-built archive from the releases page.
+
+<Note>
+  Commands that read the application graph (`arc routes`, `arc typegen`, `arc build`) require the `uag` feature. The `arc queue` family requires `database` + `jobs`. `arc doctor` requires `database`. `arc key:generate` requires `auth`. The generated application enables all of these through its own feature flags — the restrictions only affect hand-assembled builds.
+</Note>
+
+## Command Groups
+
+<Accordion title="Scaffold — arc new, arc install, arc key:generate, arc storage:link">
+
+### `arc new <name>`
+
+Generates a complete application directory, mints `APP_KEY`, and runs `npm install` by default. The generated project is ready to run immediately with `arc dev`.
+
+```bash
+arc new my-app
+arc new my-app --stack vue --db postgres --dest /srv/projects/my-app
+arc new my-app --no-install   # skip npm install; run arc install later
+```
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `<name>` | string | required | Project name and default directory name |
+| `--stack` | `react` \| `vue` \| `svelte` | `react` | Frontend stack to scaffold |
+| `--db` | `postgres` \| `sqlite` \| `mysql` | `sqlite` | Database driver |
+| `--dest` | path | `./<name>` | Where to write the generated project |
+| `--no-install` | flag | off | Skip `npm install`; run `arc install` yourself later |
+
+SQLite is the default driver because `sqlite://storage/<name>.sqlite?mode=rwc` is created on first connect — no server, no credentials, nothing to start. Postgres is one flag away for production work. `arc new` refuses to write into a directory that already exists; there is no `--force`.
+
+<Warning>
+  **Known issue in 0.1.3:** `arc new` with the default React stack does not run under `arc dev` — the dev document omits the `@vitejs/plugin-react` refresh preamble, so the browser reports "can't detect preamble". Vue and Svelte are unaffected.
+</Warning>
+
+---
+
+### `arc install [--ci]`
+
+Installs the frontend's npm dependencies by running `npm install` (or `npm ci` with `--ci`) in the current directory. `arc new` calls this automatically unless `--no-install` was given.
+
+```bash
+arc install        # npm install
+arc install --ci   # npm ci — enforces package-lock.json
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--ci` | off | Use `npm ci` instead of `npm install` |
+
+---
+
+### `arc key:generate [--show]`
+
+Generates a 64-byte application key from the OS CSPRNG and writes it as `APP_KEY` in `.env`. The key is the secret behind sessions, CSRF tokens, and remember-me credentials. `arc new` calls this automatically.
+
+```bash
+arc key:generate          # write APP_KEY to .env
+arc key:generate --show   # print the key instead
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--show` | off | Print the key to stdout instead of writing it to `.env` |
+
+Requires the `auth` feature (which owns the certified RNG and the key type).
+
+---
+
+### `arc storage:link`
+
+Creates a symlink from `public/storage` to `storage/app/public`, making locally stored files available through the web server's document root.
+
+```bash
+arc storage:link
+```
+
+No flags. Refuses to overwrite an existing symlink or directory without deleting it first.
+
+</Accordion>
+
+<Accordion title="Serve — arc serve, arc dev">
+
+### `arc serve [--bind <addr>] [--port <n>]`
+
+Runs the application by invoking `cargo run` in the current directory and forwarding the bind address and port as environment variables. This is a thin wrapper — the application binary owns its own server configuration.
+
+```bash
+arc serve
+arc serve --port 8080
+arc serve --bind 0.0.0.0 --port 8080
+```
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--port` | u16 | from environment | Forwarded as `ARCATURE_BACKEND_PORT` |
+| `--bind` | string | from environment | Forwarded as `ARCATURE_BACKEND_BIND` |
+
+For interactive development with hot-reloading, use `arc dev` instead.
+
+---
+
+### `arc dev [--port <n>] [--host <addr>] [--open]`
+
+The development supervisor. Binds one TCP port, runs the application and Vite as child processes on private IPC endpoints, and proxies browser requests to whichever process owns them. Rebuilds the application on source changes; Ctrl-C stops everything cleanly.
+
+```bash
+arc dev
+arc dev --port 3000
+arc dev --host 0.0.0.0 --open
+```
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--port` | u16 | `1183` | The single TCP port to serve on |
+| `--host` | IP address | `127.0.0.1` | Address to bind; loopback by default to avoid publishing a dev build |
+| `--open` | flag | off | Open a browser once the first build is serving |
+
+The startup sequence is ordered and non-interchangeable: project detection → npm dependency check → Vite start → TCP bind → first build → ready banner. Vite runs in middleware mode on an IPC endpoint (`ARCATURE_VITE_IPC`); it never binds its own TCP port. A rebuild replaces only the application child, keeping the listener bound and HMR connections alive across saves.
+
+```text
+  Arcature 0.1.3
+
+  Local:    http://127.0.0.1:1183
+  Network:  use --host to expose
+```
+
+<Warning>
+  **Known issue in 0.1.3:** `arc dev` has been seen looping `superseded` / `building` without ever serving. Cause not identified.
+</Warning>
+
+</Accordion>
+
+<Accordion title="Database — arc migrate, arc schedule, arc db:seed, arc db:fresh, arc db:reset">
+
+### `arc migrate [--dsn <url>]`
+
+Runs pending migrations by invoking `cargo run -- --migrate` in the current directory. The application's own binary applies migrations through its `MigratorTrait` impl — Arcature does not own a separate migration engine.
+
+```bash
+arc migrate
+arc migrate --dsn postgres://user:pass@localhost/mydb
+```
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--dsn` | URL | `DATABASE_URL` | Override the database URL for this run only |
+
+---
+
+### `arc schedule [--dsn <url>]`
+
+Starts the job scheduler by invoking `cargo run -- --schedule`. The scheduler runs until interrupted.
+
+```bash
+arc schedule
+arc schedule --dsn postgres://user:pass@localhost/mydb
+```
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--dsn` | URL | `DATABASE_URL` | Override the database URL |
+
+---
+
+### `arc db:seed [--dsn <url>]`
+
+Runs the application's seeders. Forwards `--db-seed` to the application binary.
+
+```bash
+arc db:seed
+arc db:seed --dsn sqlite://./storage/app.sqlite
+```
+
+---
+
+### `arc db:fresh [--dsn <url>] [--force]`
+
+Drops every table, re-runs migrations, then seeds. **Destructive** — requires `--force`. Never prompts interactively, because these commands are as likely to run in CI as at a terminal.
+
+```bash
+arc db:fresh --force
+arc db:fresh --force --dsn postgres://user:pass@localhost/mydb
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--force` | off | Required for destructive operations |
+| `--dsn` | `DATABASE_URL` | Override the database URL |
+
+---
+
+### `arc db:reset [--dsn <url>] [--force]`
+
+Rolls every migration back. **Destructive** — requires `--force`.
+
+```bash
+arc db:reset --force
+```
+
+</Accordion>
+
+<Accordion title="Queue — arc queue work, arc queue drain, arc queue stats">
+
+All three `arc queue` subcommands connect directly to the database (no application binary) and require `database` + `jobs` features. They apply the queue schema if it is absent before executing their action.
+
+### `arc queue work`
+
+Runs a standalone worker that sweeps expired leases. Note that this worker has an empty handler registry — it reports unknown jobs as dead rather than dispatching them. Most applications use the in-process worker registered through `ApplicationBuilder::jobs`. `arc queue work` is useful for sweeping lease-expired rows without starting the full application.
+
+```bash
+arc queue work
+arc queue work --dsn postgres://user:pass@localhost/mydb
+```
+
+### `arc queue drain`
+
+Requeues all dead jobs back to pending (resets attempt counts) and sweeps expired leases. Useful after an outage where jobs were marked dead.
+
+```bash
+arc queue drain
+arc queue drain --dsn postgres://user:pass@localhost/mydb
+```
+
+### `arc queue stats`
+
+Prints the count of jobs in each state: pending, running, dead, and cancelled.
+
+```bash
+arc queue stats
+```
+
+Example output:
+
+```text
+pending: 42
+running: 3
+dead: 1
+cancelled: 0
+```
+
+| Flag (all subcommands) | Type | Default | Description |
+|---|---|---|---|
+| `--dsn` | URL | `DATABASE_URL` | Database URL; error if unset and not provided |
+
+</Accordion>
+
+<Accordion title="Tools — arc doctor, arc version, arc routes, arc typegen, arc build">
+
+### `arc doctor`
+
+Runs a read-only health check of the local environment. Reports the framework version, the Rust toolchain, the configured linker, and (when `DATABASE_URL` is set) whether the database is reachable. On Windows, also checks whether Microsoft Defender has `target/` excluded.
+
+```bash
+arc doctor
+```
+
+Three output markers:
+- `[ok]` — working correctly
+- `[warn]` — working but costing developer time (e.g. slow linker)
+- `[FAIL]` — broken; exits non-zero so scripts can branch on the result
+
+Requires the `database` feature.
+
+---
+
+### `arc version`
+
+Prints the framework version. Also available as `arc --version` and `arc -V`.
+
+```bash
+arc version
+# Arcature 0.1.3
+```
+
+---
+
+### `arc routes [--json]`
+
+Reads the application graph and prints every declared route as a table. Five columns: METHOD, PATH, NAME, HANDLER, POLICIES. An unnamed route shows `-` in the NAME column; an unguarded route shows `-` in POLICIES.
+
+```bash
+arc routes
+arc routes --json
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--json` | off | Emit the route list as JSON instead of a table |
+
+Requires the `uag` feature. Reads the same artifact that `arc typegen` and OpenAPI documents are built from, so the three can never disagree.
+
+<Tip>
+  The POLICIES column makes a security review practical: a `POST /admin/users` with a dash in that column is the route worth noticing, and it is visible in one screen without opening every controller.
+</Tip>
+
+---
+
+### `arc typegen`
+
+Validates the application graph and writes four TypeScript files to `resources/js/generated/`:
+
+| File | Contents |
+|---|---|
+| `routes.ts` | Typed route table and a `route()` helper |
+| `pages.d.ts` | Per-page prop type declarations |
+| `forms.ts` | Field names and validation rules |
+| `index.ts` | Barrel re-export (the `@/generated` alias target) |
+
+```bash
+arc typegen
+```
+
+No flags. Validation runs before anything is written — a single diagnostic stops the run with zero files written. The directory is gitignored by the scaffold; these files are derived from Rust source and a checked-in copy would be a second source of truth.
+
+Requires the `uag` feature.
+
+---
+
+### `arc build`
+
+Runs the four-stage production build in order, stopping on the first failure and naming which stage failed:
+
+```bash
+arc build
+```
+
+```text
+[1/4] graph
+      read from .arcature/dev.addr
+[2/4] typegen
+      4 files in resources/js/generated/
+[3/4] cargo build --release
+[4/4] npm run build
+Build finished.
+```
+
+| Stage | What runs |
+|---|---|
+| `graph` | Reads the application graph |
+| `typegen` | Validates it and writes `resources/js/generated/` |
+| `cargo` | `cargo build --release` |
+| `vite` | `npm run build` |
+
+TypeScript generation runs before the frontend build on purpose — Vite compiles what `arc typegen` writes, so running them in the other order would ship a bundle built against the previous graph.
+
+Requires the `uag` feature.
+
+</Accordion>
