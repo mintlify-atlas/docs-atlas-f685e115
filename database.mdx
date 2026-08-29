@@ -1,7 +1,7 @@
 ---
-title: "Database: SeaORM + SQLx Over One Shared Pool"
+title: "Database: SeaORM and SQLx Over a Single Shared Pool"
 sidebarTitle: "Database"
-description: "Connect to PostgreSQL, SQLite, or MySQL with a single shared pool that both SeaORM and SQLx read from — no global registry, no thread-locals, no second pool."
+description: "Connect to PostgreSQL, SQLite, or MySQL with one shared pool that both SeaORM and SQLx read from. No global registry, no thread-locals, no second pool."
 ---
 
 Arcature's database layer gives SeaORM and SQLx a single shared connection pool. There is no second pool, no global registry, and no thread-local — `SqlxPostgresConnector::from_sqlx_postgres_pool` bridges the two libraries at startup, and both sides use the same connections from that point on. The `Db` handle is `Clone + Send + Sync + 'static`, so it fits naturally into Axum state alongside anything else your application holds.
@@ -66,7 +66,7 @@ pub mod user {
     #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
     #[sea_orm(table_name = "users")]
     pub struct Model {
-        #[sea_orm(primary_key)
+        #[sea_orm(primary_key)]
         pub id: i64,
         pub email: String,
         pub name: String,
@@ -170,7 +170,7 @@ use arcature::database::{delete, find_by_pk, insert, update};
 let created = insert(&db, user::ActiveModel { .. }).await?;
 let changed = update(&db, active_model).await?;
 delete(&db, active_model).await?;
-let found = find_by_pk::<user::Entity, _>(&db, 1_i64).await?;
+let found = find_by_pk::<user::Entity>(&db, 1_i64).await?;
 ```
 
 ## Transactions

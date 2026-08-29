@@ -1,7 +1,7 @@
 ---
-title: "Sending Email via SMTP with Arcature Mail"
+title: "Sending Transactional Email via SMTP with Arcature Mail"
 sidebarTitle: "Mail"
-description: "Send transactional email over SMTP using lettre and rustls. Covers the Mailable trait, Email builder, SmtpConfig, credential redaction, and in-memory capture for tests."
+description: "Arcature mail over lettre and rustls. Covers SmtpConfig, the Mailable trait, Email body terminators, credential redaction, and in-memory capture for tests."
 ---
 
 Arcature's mail subsystem integrates [lettre](https://lettre.rs/) for SMTP transport and [rustls](https://github.com/rustls/rustls) + aws-lc-rs for TLS. The framework owns the ergonomics; lettre owns the protocol. `Mail` is a value, not a namespace — the facade holds the mailer and the `From` address, so `mail.to(address).send(&mailable)` is the full send path.

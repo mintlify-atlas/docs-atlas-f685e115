@@ -1,7 +1,7 @@
 ---
 title: "Cache: Redis and Valkey Key-Value Store Integration"
 sidebarTitle: "Cache"
-description: "One multiplexed Redis/Valkey connection with typed get/set, atomic counters, TTL control, and a cache-aside helper that never silently falls through to the loader."
+description: "One multiplexed Redis/Valkey connection with typed get/set, atomic counters, TTL management, and a cache-aside helper that prevents silent fallthrough."
 ---
 
 Arcature's cache subsystem wraps a single `redis-rs` `MultiplexedConnection` — not a pool. A multiplexed connection is cheap to clone, thread-safe, and sends all commands over one socket, so adding a second connection layer would buy nothing. `Cache` is a value with methods; you hold it in state and call it directly. There is no static `Cache::get` form.
@@ -98,17 +98,7 @@ let user = cache
     .await?;
 ```
 
-The loader's error type must implement `Into<CacheError>`. Check this before writing the closure: a loader that returns `sqlx::Error` or `sea_orm::DbErr` needs a conversion, or the closure needs to map it:
-
-```rust
-let report = cache
-    .remember("report:monthly", Duration::from_secs(3600), || async {
-        build_report()
-            .await
-            .map_err(|e| arcature::cache::CacheError::loader(e.to_string()))
-    })
-    .await?;
-```
+The loader's error type must implement `Into<CacheError>`. Check this before writing the closure: a loader that returns `sqlx::Error` or `sea_orm::DbErr` has no built-in conversion into `CacheError`. Wrap or map the error in your application before returning it from the loader.
 
 <Warning>
 A backend failure does **not** silently run the loader. If Redis or Valkey is unreachable, `remember` returns `CacheError::Backend` immediately. Arcature does not decide fail-open semantics on your behalf — silently degrading to the database under load is how a cache outage becomes a database outage. If you want the loader to run when the cache is down, handle `CacheError::Backend` explicitly before calling `remember`.
@@ -123,7 +113,7 @@ use arcature::cache::CacheError;
 
 let result = cache
     .remember("expensive:computation", Duration::from_secs(60), || async {
-        compute().await.map_err(CacheError::loader_string)
+        compute().await.map_err(Into::into)
     })
     .await;
 
@@ -167,7 +157,7 @@ The cache subsystem does not reimplement the Redis/RESP protocol, run a cache se
 use arcature::cache::redis;
 
 // Direct redis-rs access for commands not in the Cache facade.
-let mut conn = cache.raw_connection().await?;
+let mut conn = cache.connection();
 let keys: Vec<String> = redis::cmd("KEYS")
     .arg("acme:session:*")
     .query_async(&mut conn)

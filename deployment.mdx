@@ -1,12 +1,29 @@
 ---
-title: "Deploying Arcature Applications to Production"
+title: "Deploying Arcature Applications to Production Servers"
 sidebarTitle: "Deployment"
-description: "Release builds, the request pipeline stage order, health endpoints, startup and shutdown sequencing, multi-instance concerns, security headers, and port resolution."
+description: "Release builds with arc build, the 23-stage pipeline order, health endpoints, startup sequencing, security headers, rate limiting, and port resolution."
 ---
 
 An Arcature application is one binary that listens on one TCP port. There is no separate Node process, no PHP-FPM pool, and no asset server. What you deploy is the binary, the built frontend assets, and whatever the application reads from the environment.
 
 ## Building for release
+
+For a generated application, `arc build` is the production build command. It runs four stages in order, stopping on any failure:
+
+```bash
+arc build
+```
+
+| Stage | What it does |
+|---|---|
+| 1 — graph | Reads the application graph (the same way `arc routes` and `arc typegen` do). |
+| 2 — typegen | Validates the graph and writes `resources/js/generated/` so Vite compiles the latest types. |
+| 3 — cargo | Runs `cargo build --release`. |
+| 4 — vite | Runs `npm run build`, producing `public/build` and the asset manifest. |
+
+Typegen runs before the frontend build because Vite compiles what typegen writes — generating after would ship a bundle built against the previous graph.
+
+For a library-only crate with no frontend, `cargo build --release` is sufficient:
 
 ```bash
 cargo build --release

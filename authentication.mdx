@@ -8,7 +8,7 @@ Arcature's `auth` module owns the integration seams, not your identity schema. T
 
 ## The User Contract
 
-Every authenticated application implements two traits: `AuthUser` on the model, and `UserLoader<AppState>` to reload it from the session.
+Every authenticated application implements two traits: `AuthUser` on the model, and `UserLoader<S>` to reload it from the session. `UserLoader<S>` is generic over your application state type — the concrete spelling in your codebase is usually `UserLoader<AppState>`.
 
 ```rust
 use arcature::AuthUser;
@@ -57,7 +57,7 @@ impl UserLoader<AppState> for User {
 
 ### The `absolute_max_age` override
 
-`absolute_max_age()` is an optional method on `AuthUser` that sets the maximum session lifetime measured from login time, regardless of activity. It defaults to 30 days. This is separate from the session layer's sliding inactivity timeout: one bounds how long a session can live in total, the other how long it can idle.
+`absolute_max_age()` is an optional method on `UserLoader<S>` that sets the maximum authenticated session lifetime measured from login time, regardless of activity. It defaults to 30 days. This is separate from the session layer's sliding inactivity timeout: one bounds how long a session can live in total, the other how long it can idle.
 
 ## Extractors
 
@@ -128,12 +128,12 @@ use arcature::auth::{
 let hasher = PasswordHasher::new(PasswordConfig::default())?;
 let stored: String = hasher.hash(b"correct horse battery staple")?.to_string();
 
-// Verify at login.
+// Verify at login — takes the hasher, the plaintext, and the parsed hash.
 let parsed = PasswordHashString::new(&row.password_hash)?;
-verify_password(b"attempt", &parsed)?;
+verify_password(&hasher, b"attempt", &parsed)?;
 
 // Check whether parameters have changed since this hash was written.
-if matches!(hasher.needs_rehash(&parsed), RehashOutcome::Rehash) {
+if matches!(hasher.needs_rehash(&parsed), RehashOutcome::NeedsRehash) {
     // Re-hash transparently on next successful login.
 }
 ```

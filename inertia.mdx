@@ -170,9 +170,9 @@ use arcature::inertia::{Props, always, deferred, eager, optional};
 
 pub async fn index(inertia: Inertia) -> Result<Response> {
     let props = Props::new()
-        .prop("user", always(current_user))
-        .prop("links", eager(links_list))
-        .prop("analytics", deferred(|| async { load_analytics().await }));
+        .with("user", always(current_user))
+        .with("links", eager(links_list))
+        .with("analytics", deferred(|| async { load_analytics().await }));
 
     Ok(inertia.render_advanced("links/index", props).await?)
 }

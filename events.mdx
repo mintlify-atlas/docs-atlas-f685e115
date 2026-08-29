@@ -1,7 +1,7 @@
 ---
-title: "In-Process Typed Event Dispatch in Arcature"
+title: "In-Process Typed Event Dispatch with Arcature Events"
 sidebarTitle: "Events"
-description: "Dispatch strongly-typed events to registered listeners within a single process. Covers event declaration, listener registration, error handling, and the recording dispatcher for tests."
+description: "Declare typed events and register async listeners in Arcature. Covers serde round-trips, DispatchError variants, and the recording Dispatcher for testing."
 ---
 
 Arcature's event system provides in-process typed dispatch — not a message bus, not durable, and not cross-process. If the process dies mid-dispatch, any remaining listeners do not run. For work that must survive a restart, use the [Jobs](jobs) queue instead; the common pattern is a listener that enqueues a job, bridging the two systems.

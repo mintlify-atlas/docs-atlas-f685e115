@@ -52,7 +52,7 @@ arc make:module admin/billing
 
 Files written:
 
-```
+```text
 app/modules/billing/mod.rs       # module! DSL declaration
 app/modules/billing/controller.rs
 app/modules/billing/service.rs
@@ -309,7 +309,7 @@ arc make:view invoice
 
 Files written:
 
-```
+```text
 app/views/admin/receipt_view.rs   # struct with #[template(path = "admin/receipt.html")]
 templates/admin/receipt.html      # the Askama template
 ```
@@ -344,7 +344,7 @@ arc make:auth admin
 
 Files written (example: `arc make:auth user`):
 
-```
+```text
 app/auth/user_account.rs        # account model implementing UserLoader
 app/auth/login_controller.rs    # login / logout handlers
 app/auth/register_controller.rs # registration handler

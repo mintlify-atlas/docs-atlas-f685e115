@@ -24,7 +24,7 @@ arcature = { version = "0.1", features = ["views"] }
 
 ### Writing a view
 
-A view is a struct whose fields are the values its template names. The `askama = arcature::askama` key points the derive at the re-exported askama crate so the application does not need its own `askama` dependency at a potentially different version.
+A view is a struct whose fields are the values its template names. The `askama = arcature::askama` key points the derive at the re-exported askama 0.16 crate so the application does not need its own `askama` dependency at a potentially different version.
 
 ```rust
 use arcature::view::Template;
@@ -216,7 +216,7 @@ let english = Catalog::parse(
 
 A sample `.ftl` file demonstrating plural forms:
 
-```
+```fluent
 # locales/en.ftl
 greeting = Hello, { $name }!
 files-count = { $count ->

@@ -1,7 +1,7 @@
 ---
-title: "Testing Arcature Applications In-Process"
+title: "Testing Arcature Applications In-Process with test-kit"
 sidebarTitle: "Testing"
-description: "Drive your router with tower::ServiceExt::oneshot, assert layer order, test events and mail with recorders, and boot a full application in-process with the test-kit feature."
+description: "Drive your router with tower::ServiceExt::oneshot, assert layer order, test mail and events with recorders, and boot a full app in-process with test-kit."
 ---
 
 Arcature applications are tested the way Tower services are tested: build the router, drive it in-process, assert on the response. There is no socket, no port to allocate, and no teardown race between test threads. The framework's own test suite uses this pattern throughout, and the same approach scales from a single-route unit test to a full application with subsystem startup.
@@ -139,7 +139,7 @@ assert!(body["errors"]["email"].is_array());
 
 ## Databases in tests
 
-There is no per-test transaction rollback helper and no test database provisioner. A test that needs a database connects to one named by an environment variable and is responsible for its own cleanup. The `DATABASE_URL` (or `ARCATURE_TEST_DB_URL`) environment variable provides the connection string. This is less convenient than a rollback-per-test approach and is a known gap in the framework's tooling.
+There is no automatic per-test transaction rollback, but `TestDatabase::begin()` provides a `TestTransaction` that rolls back when dropped — so a test that panics leaves nothing behind. A test that needs a database connects to one named by an environment variable. The `DATABASE_URL` (or `ARCATURE_TEST_DB_URL`) environment variable provides the connection string. There is no test database provisioner; each test is responsible for its own setup and cleanup.
 
 ## The test-kit feature
 
@@ -167,7 +167,7 @@ What `test-kit` provides:
 </Accordion>
 
 <Accordion title="Session seeding with acting_as">
-Behind the `auth` feature, `TestApp::acting_as(user)` seeds a session so a request arrives already authenticated. This avoids the overhead of a full login flow in tests that are about authorisation or content, not about the login form itself.
+Behind the `auth` feature, `TestRequest::acting_as(user)` seeds a session so the request arrives already authenticated. This avoids the overhead of a full login flow in tests that are about authorisation or content, not about the login form itself.
 </Accordion>
 
 <Accordion title="Database assertions">

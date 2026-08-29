@@ -152,39 +152,51 @@ Three things to notice here:
 app/
   controllers/   models/     services/
   requests/      policies/   resources/
+  pages/         views/      modules/
 bootstrap/
   app.rs         state.rs
 config/
-database/migrations/
+database/
+  migrations/    seeders/
 routes/mod.rs
 resources/js/    resources/css/
 public/
 storage/
-src/main.rs      src/lib.rs
+templates/
+src/main.rs      src/lib.rs   src/bin/uag.rs
 tests/smoke.rs
 .env
 ```
 
-`bootstrap/app.rs` is the composition root. It loads `.env`, reads typed configuration, and wires the subsystems into an `ApplicationBuilder`:
+`bootstrap/app.rs` is the composition root. It loads `.env`, reads typed configuration, and wires the subsystems into an `ApplicationBuilder`. The real template also constructs a session store, error pages, CSRF config, and a password hasher; the shape below shows the structure:
 
 ```rust
-pub fn app() -> Result<Application<crate::bootstrap::AppState>> {
+pub fn app(options: BootOptions) -> Result<Bootstrapped> {
     dotenvy::dotenv().ok();
     let config = crate::config::load()?;
-    Ok(Application::new()
-        .routes(crate::routes::routes())
+    let hasher = Arc::new(PasswordHasher::new(PasswordConfig::default())?);
+    let state_fn = crate::bootstrap::state_fn(&config, hasher.clone());
+
+    let mut builder = Application::new()
+        .routes(crate::routes::app_routes())
+        .merge_routes(crate::app::modules::routes())
         .bind(&config.bind_addr)
         .port(config.port)
         .database(config.database)
-        .cache(config.cache)
         .storage(config.storage)
         .mail(config.mail)
-        .jobs(jobs_registry())
-        .build())
+        .jobs(jobs_registry());
+
+    // Cache is opt-in: only wired when REDIS_URL is present.
+    if let Some(cache) = config.cache {
+        builder = builder.cache(cache);
+    }
+
+    Ok(Bootstrapped { application: builder.build(), state_fn })
 }
 ```
 
-`bootstrap/state.rs` defines `AppState` — the cloneable bundle every handler reaches through `State<AppState>`. Each field is an `Option` because a subsystem that was never configured contributes `None` rather than panicking:
+`bootstrap/state.rs` defines `AppState` — the cloneable bundle every handler reaches through `State<AppState>`. Subsystem fields are `Option` because a subsystem that was never configured contributes `None` rather than panicking. The generated state also carries a few application-level values that handlers need at request time:
 
 ```rust
 #[derive(Clone)]
@@ -194,19 +206,33 @@ pub struct AppState {
     pub cache: Option<Cache>,
     pub storage: Option<Storage>,
     pub mail: Option<Mailer>,
+    pub hasher: Arc<PasswordHasher>,
+    pub app_name: String,
+    pub app_url: String,
+    pub mail_from: String,
 }
 ```
 
-The state is produced after startup from the started `Resources`, which is why it is a closure rather than a value:
+The state is produced after startup from the started `Resources`, which is why it is a closure rather than a value. `state_fn` takes the resolved config and the shared hasher (constructed once at startup, not per request) and captures them by clone for the lifetime of the application:
 
 ```rust
-pub fn state_fn() -> Arc<dyn Fn(&Resources, &Lifecycle) -> AppState + Send + Sync> {
-    Arc::new(|res, _lc| AppState {
+pub fn state_fn(
+    config: &Config,
+    hasher: Arc<PasswordHasher>,
+) -> Arc<dyn Fn(&Resources, &Lifecycle) -> AppState + Send + Sync> {
+    let app_name = config.app_name.clone();
+    let app_url = config.app_url.clone();
+    let mail_from = config.mail_from.clone();
+    Arc::new(move |res, _lc| AppState {
         db: res.db().cloned(),
         jobs: res.jobs().cloned(),
         cache: res.cache().cloned(),
         storage: res.storage().cloned(),
         mail: res.mail().cloned(),
+        hasher: hasher.clone(),
+        app_name: app_name.clone(),
+        app_url: app_url.clone(),
+        mail_from: mail_from.clone(),
     })
 }
 ```

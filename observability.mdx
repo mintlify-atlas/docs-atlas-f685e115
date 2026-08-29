@@ -1,7 +1,7 @@
 ---
-title: "Observability: Logs, Metrics, and Tracing"
+title: "Observability: Logs, Metrics, and Tracing in Arcature"
 sidebarTitle: "Observability"
-description: "Structured JSON logs with redaction, a Prometheus metrics registry, W3C trace context propagation, and optional OTLP span export — all driven by values your application holds."
+description: "Structured JSON logs with redaction, Prometheus metrics, W3C trace context, and optional OTLP span export — all held as values, never installed globally."
 ---
 
 Arcature's observability stack is built around one rule: nothing installs itself. There is no global subscriber, no global recorder, and no global tracer provider. A `JsonLog` sink, a `Metrics` registry, and a `Telemetry` pipeline are values the application holds and clones. The subscriber is installed by a call your application makes. This design means a test can capture exactly its own output without touching a global, and a binary can compose its own subscriber without fighting anything the library already registered.

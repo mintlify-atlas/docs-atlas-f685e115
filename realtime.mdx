@@ -1,7 +1,7 @@
 ---
 title: "WebSocket and SSE Realtime Connections in Arcature"
 sidebarTitle: "Realtime"
-description: "Add WebSocket and Server-Sent Events to your Axum app using a bounded broadcast channel. Covers Broadcast, SseEndpoint, WebSocketEndpoint, connection limits, lag handling, and graceful drain."
+description: "Thin Axum WebSocket and SSE wrappers in Arcature. Covers Broadcast, SseEndpoint, WebSocketEndpoint, connection cap, lag handling, and graceful drain."
 ---
 
 Arcature's realtime layer provides thin, typed wrappers over Axum's native `axum::extract::ws` and `axum::response::sse`. The fan-out core is a bounded `tokio::sync::broadcast` channel — one message published once, cloned to every subscriber. There is no proprietary protocol, no `X-Arcature-*` headers, and no JavaScript client package: browsers connect with the standard `WebSocket` and `EventSource` APIs.

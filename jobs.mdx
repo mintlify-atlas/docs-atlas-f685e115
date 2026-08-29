@@ -1,13 +1,13 @@
 ---
-title: "Durable Background Jobs on PostgreSQL with Arcature"
+title: "Arcature Background Jobs: PostgreSQL, SQLite, and MySQL"
 sidebarTitle: "Jobs"
-description: "Run at-least-once background jobs over your existing PostgreSQL pool. Covers job declaration, enqueueing, handlers, retry policies, scheduling, and the Worker configuration."
+description: "At-least-once background jobs on PostgreSQL, SQLite, or MySQL in Arcature. Covers declaring, enqueueing, handlers, retry policies, and the Worker."
 ---
 
-Arcature's job queue is a `FOR UPDATE SKIP LOCKED` queue built on top of your application's existing `PgPool` — no second connection pool, no separate broker to operate. Jobs are at-least-once, so a handler must be idempotent, but claims are fenced by a per-claim UUID so a stale worker waking up late cannot commit its result over another worker's active claim.
+Arcature's job queue runs over your application's existing database pool — no second connection pool, no separate broker. The queue is at-least-once, so a handler must be idempotent, but claims are fenced by a per-claim UUID so a stale worker waking up late cannot commit its result over another worker's active claim.
 
 <Note>
-The job queue requires **PostgreSQL**. `FOR UPDATE SKIP LOCKED` is the entire design, and SQLite and MySQL do not have a usable equivalent. An application using `db-sqlite` has the rest of the framework with no job queue.
+The queue uses `FOR UPDATE SKIP LOCKED` on **PostgreSQL**, a locking `SELECT` + transaction on **MySQL 8**, and `BEGIN IMMEDIATE` (exclusive write lock) on **SQLite**. All three are supported. SQLite serialises claimers at the database level, which is the right trade-off for single-node deployments.
 </Note>
 
 ## Enabling the Feature
@@ -236,16 +236,16 @@ scheduler.run(CancellationToken::new()).await?;
 `Observer` is the observability seam; the default is `NoopObserver`. Implement the trait and pass it to `WorkerBuilder::observer` to receive events for claims, completions, and failures:
 
 ```rust
-use arcature::jobs::{Observer, SharedObserver};
+use arcature::jobs::Observer;
 
 struct MyObserver;
 
 impl Observer for MyObserver {
-    // implement event hooks
+    // implement observe(&self, event: &Event) here
 }
 
 let worker = Worker::builder(pool.clone(), registry())
-    .observer(SharedObserver::new(MyObserver))
+    .observer(MyObserver)
     .build();
 ```
 

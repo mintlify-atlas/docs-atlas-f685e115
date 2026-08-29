@@ -1,7 +1,7 @@
 ---
-title: "Multi-Channel Notifications in Arcature"
+title: "Multi-Channel Notifications: Mail, Inbox, and Live Push"
 sidebarTitle: "Notifications"
-description: "Send one event to one person over mail, an in-app inbox, and a live push. Covers the Notification trait, Notifier wiring, delivery ordering, the database inbox, and queue deferral."
+description: "Arcature multi-channel notifications: mail, in-app inbox, and live push. Covers Notification, Notifier, Delivery, inbox queries, and queue deferral."
 ---
 
 The `notifications` feature implements a single-event, multi-channel delivery system: one notification reaches a recipient over whichever channels apply — an email, a row in an in-app inbox, and a live push to any open connection. A `Notifier` is a value you build at startup; nothing in `Application` constructs one for you.
